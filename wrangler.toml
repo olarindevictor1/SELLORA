@@ -1,0 +1,53 @@
+name = "sellora-commerce"
+main = "worker/index.ts"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = [
+  "/",
+  "/api/*",
+  "/robots.txt",
+  "/sitemap.xml",
+  "/shop",
+  "/about",
+  "/contact",
+  "/faq",
+  "/policies",
+  "/privacy-policy",
+  "/terms",
+  "/product/*",
+  "/category/*",
+  "/admin*",
+  "/account*",
+  "/checkout*",
+  "/track*"
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sellora-db"
+database_id = "a6738474-f10d-4210-b8fe-194fab0e3bd8"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "R2_MEDIA"
+bucket_name = "sellora-media-private"
+
+[vars]
+# Leave APP_URL empty to auto-detect the live Worker hostname (or set your custom domain e.g. "https://shop.yourdomain.com")
+APP_URL = ""
+OWNER_EMAIL = "olarindevictor3@gmail.com"
+ADMIN_NOTIFICATION_EMAIL = "olarindevictor3@gmail.com"
+BREVO_FROM_NAME = "SELLORA"
+# Optional integrations (safe to leave empty during initial deployment; disabled gracefully until configured)
+GOOGLE_SITE_VERIFICATION = ""
+VITE_GA_MEASUREMENT_ID = ""
+VITE_TURNSTILE_SITE_KEY = ""
+
+# Cron Trigger for queued email retry processing (optional on Workers Free tier — check plan limits)
+# [triggers]
+# crons = ["*/5 * * * *"]

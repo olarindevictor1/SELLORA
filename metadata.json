@@ -1,0 +1,6 @@
+{
+  "name": "SELLORA — Commerce without limits.",
+  "description": "Complete single-store ecommerce platform and store management dashboard built for Nigeria with NGN pricing, Nigerian State/LGA delivery zones, manual bank transfer review, Track Order, Better Auth, and Brevo transactional email.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
