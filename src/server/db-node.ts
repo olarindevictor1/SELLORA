@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { SelloraDb, SelloraStorage } from './db';
+import type { BatchResult, BatchStatement, SelloraDb, SelloraStorage } from './db';
 
 export function createSqliteDb(dbPath: string, migrationsDir: string): SelloraDb {
   const dir = path.dirname(dbPath);
@@ -26,6 +26,26 @@ export function createSqliteDb(dbPath: string, migrationsDir: string): SelloraDb
       const res = conn.prepare(sql).run(...params);
       return { changes: res.changes };
     },
+    async batch(statements: BatchStatement[]): Promise<BatchResult[]> {
+      if (statements.length === 0) return [];
+      conn.exec('BEGIN IMMEDIATE');
+      try {
+        const results: BatchResult[] = [];
+        for (const s of statements) {
+          const res = conn.prepare(s.sql).run(...(s.params ?? []));
+          results.push({ changes: res.changes });
+        }
+        conn.exec('COMMIT');
+        return results;
+      } catch (err) {
+        try {
+          conn.exec('ROLLBACK');
+        } catch {
+          // ignore if transaction already rolled back
+        }
+        throw err;
+      }
+    },
     async exec(sql: string): Promise<void> {
       conn.exec(sql);
     },
@@ -36,7 +56,11 @@ export function createSqliteDb(dbPath: string, migrationsDir: string): SelloraDb
         conn.exec('COMMIT');
         return result;
       } catch (err) {
-        conn.exec('ROLLBACK');
+        try {
+          conn.exec('ROLLBACK');
+        } catch {
+          // ignore if already rolled back
+        }
         throw err;
       }
     },
@@ -102,6 +126,26 @@ export function createLocalStorage(rootDir: string): SelloraStorage {
       const fullPath = path.join(rootDir, safeKey);
       if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
       if (fs.existsSync(fullPath + '.meta.json')) fs.unlinkSync(fullPath + '.meta.json');
+    },
+    async list(prefix: string): Promise<Array<{ key: string; uploadedAt: string }>> {
+      const safePrefix = prefix.replace(/\.\./g, '').replace(/^\/+/, '');
+      const targetDir = path.join(rootDir, safePrefix);
+      if (!fs.existsSync(targetDir)) return [];
+      const results: Array<{ key: string; uploadedAt: string }> = [];
+      const walk = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+          } else if (!entry.name.endsWith('.meta.json')) {
+            const rel = path.relative(rootDir, full).replace(/\\/g, '/');
+            const stat = fs.statSync(full);
+            results.push({ key: rel, uploadedAt: stat.mtime.toISOString() });
+          }
+        }
+      };
+      walk(targetDir);
+      return results;
     },
   };
 }

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Check, Printer, Search, X } from 'lucide-react';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, resolveApiUrl } from '../../lib/api';
 import {
   DELIVERY_STATUSES,
   DELIVERY_STATUS_LABELS,
@@ -113,7 +113,7 @@ export const AdminOrdersTab: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-[#172554]">Orders & Fulfilment</h2>
           <p className="text-xs text-slate-500">
-            Search by Order Number, Internal Order ID, Customer Name, Email, or Phone.
+            Search by Order Number, Customer Name, Email, or Phone.
           </p>
         </div>
         {selectedIds.size > 0 && (
@@ -144,7 +144,7 @@ export const AdminOrdersTab: React.FC = () => {
             type="text"
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Search SLR-..., ord_..., customer name, email, phone..."
+            placeholder="Search order number, customer name, email, or phone..."
             className="w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 py-2 text-xs"
           />
         </div>
@@ -254,7 +254,7 @@ export const AdminOrdersTab: React.FC = () => {
                   {detail.order.order_number}
                 </h3>
                 <p className="text-[11px] font-mono-tabular text-slate-500">
-                  ID: {detail.order.order_id} · Placed {formatLagosDate(detail.order.created_at)}
+                  Placed {formatLagosDate(detail.order.created_at)}
                 </p>
               </div>
               <div className="flex items-center gap-2 no-print">
@@ -355,7 +355,7 @@ export const AdminOrdersTab: React.FC = () => {
                       <div className="text-slate-500">{ev.receipt_original_name}</div>
                     </div>
                     <a
-                      href={`/api/payments/evidence/${ev.id}/file`}
+                      href={resolveApiUrl(`/api/payments/evidence/${ev.id}/file`)}
                       target="_blank"
                       rel="noreferrer"
                       className="rounded-lg bg-[#172554] px-3 py-1.5 font-semibold text-[#B7F36B]"

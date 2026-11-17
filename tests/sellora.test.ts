@@ -1,12 +1,20 @@
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { createD1Db, type D1LikeDatabase, type D1PreparedStatementLike } from '../src/server/db';
+import {
+  createD1Db,
+  extractDbGuardCode,
+  type D1LikeDatabase,
+  type D1PreparedStatementLike,
+  type R2LikeBucket,
+} from '../src/server/db';
 import { createSqliteDb, createLocalStorage } from '../src/server/db-node';
 import { seedInitialStoreData } from '../src/server/seed';
+import workerEntry, { type WorkerEnv } from '../worker/index';
+import { resolveApiUrl, resolveMediaUrl } from '../src/lib/api';
 import { createSelloraAuth, getSessionUser } from '../src/server/auth';
 import { createSelloraApiApp } from '../src/server/app';
 import {
@@ -23,7 +31,18 @@ import {
   sanitizeGaMeasurementId,
   sanitizeGoogleSiteVerification,
 } from '../src/server/seo';
-import { isTurnstileConfigured, verifyTurnstileToken } from '../src/server/security';
+import {
+  checkLoginThrottle,
+  checkPersistentRateLimit,
+  clearLoginThrottle,
+  getTrustedClientIp,
+  isTurnstileConfigured,
+  recordFailedLoginAttempt,
+  validateUploadedFileBytes,
+  verifyTurnstileToken,
+} from '../src/server/security';
+import { recordCapturedError } from '../src/server/error-monitor';
+import { recordLoginAttemptAndMonitor } from '../src/server/login-monitor';
 import { resolveGaMeasurementId } from '../src/lib/analytics';
 import type { AppEnvConfig } from '../src/server/context';
 import { provisionOwnerInDb } from '../src/server/owner-provisioning';
@@ -35,7 +54,7 @@ function createTestRuntime(envOverrides: Partial<AppEnvConfig> = {}) {
   const storage = createLocalStorage(path.join(tmpDir, 'r2'));
   const env: AppEnvConfig = {
     betterAuthSecret: 'test-secret-012345678901234567890123456789',
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
     appUrl: 'http://localhost:3000',
     ...envOverrides,
   };
@@ -57,7 +76,7 @@ async function provisionAndSignInOwner(
   rt: { app: any; db: any },
   opts: { name?: string; email?: string; password?: string } = {}
 ): Promise<{ cookie: string; userId: string }> {
-  const email = (opts.email || 'olarindevictor3@gmail.com').trim().toLowerCase();
+  const email = (opts.email || 'olarindevictor046@gmail.com').trim().toLowerCase();
   const password = opts.password || 'StrongOwnerPassword123!';
   const prov = await provisionOwnerInDb(rt.db, {
     name: opts.name || 'Victor Olarinde',
@@ -86,13 +105,22 @@ function createInMemoryD1Shim(migrationsDir: string): D1LikeDatabase {
     sqlite.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
   }
 
-  const makeStmt = (sql: string, bound: unknown[] = []): D1PreparedStatementLike & { raw: <T = unknown>() => Promise<T[]> } => ({
+  const makeStmt = (
+    sql: string,
+    bound: unknown[] = []
+  ): D1PreparedStatementLike & {
+    raw: <T = unknown>() => Promise<T[]>;
+    __execForBatch: () => Promise<unknown>;
+  } => ({
     bind(...values: unknown[]) {
       return makeStmt(sql, values);
     },
     async all<T = unknown>() {
       const results = sqlite.prepare(sql).all(...bound) as T[];
-      return { results, success: true, meta: {} } as { results: T[] };
+      return { results, success: true, meta: { changes: 0 } } as {
+        results: T[];
+        meta?: { changes?: number };
+      };
     },
     async first<T = unknown>() {
       const row = sqlite.prepare(sql).get(...bound);
@@ -105,6 +133,15 @@ function createInMemoryD1Shim(migrationsDir: string): D1LikeDatabase {
     async raw<T = unknown>() {
       return sqlite.prepare(sql).raw(true).all(...bound) as T[];
     },
+    async __execForBatch() {
+      const prep = sqlite.prepare(sql);
+      if (prep.reader) {
+        const results = prep.all(...bound);
+        return { results, success: true, meta: { changes: 0 } };
+      }
+      const res = prep.run(...bound);
+      return { results: [], success: true, meta: { changes: res.changes } };
+    },
   });
 
   return {
@@ -116,11 +153,23 @@ function createInMemoryD1Shim(migrationsDir: string): D1LikeDatabase {
       return { count: 1, duration: 0 };
     },
     async batch<T = unknown>(statements: D1PreparedStatementLike[]) {
-      const out: T[] = [];
-      for (const stmt of statements) {
-        out.push((await stmt.all()) as T);
+      sqlite.exec('BEGIN IMMEDIATE');
+      try {
+        const out: T[] = [];
+        for (const stmt of statements) {
+          const batchFn = (stmt as { __execForBatch?: () => Promise<unknown> }).__execForBatch;
+          out.push((batchFn ? await batchFn() : await stmt.run()) as T);
+        }
+        sqlite.exec('COMMIT');
+        return out;
+      } catch (err) {
+        try {
+          sqlite.exec('ROLLBACK');
+        } catch {
+          // ignore if already rolled back
+        }
+        throw err;
       }
-      return out;
     },
   };
 }
@@ -139,14 +188,14 @@ test('SELLORA end-to-end commerce, RBAC, tracking, payment review, and email que
     const legacyBootPost = await app.request('http://localhost:3000/api/bootstrap/owner', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'olarindevictor3@gmail.com' }),
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com' }),
     });
     assert.equal(legacyBootPost.status, 404);
 
     // 2. Server-side Owner Provisioning & Standard Sign-In
     const { cookie: ownerCookie } = await provisionAndSignInOwner(
       { app, db },
-      { email: 'olarindevictor3@gmail.com', password: 'StrongPassword123!' }
+      { email: 'olarindevictor046@gmail.com', password: 'StrongPassword123!' }
     );
 
     const provAudit = await db.get<{ action: string }>(
@@ -296,7 +345,14 @@ test('SELLORA end-to-end commerce, RBAC, tracking, payment review, and email que
     form.append('referenceNumber', 'NIP-99887766');
     form.append('amountNaira', String(orderData.totalKobo / 100));
     form.append('transferDate', '2026-11-14');
-    form.append('receipt', new File([new Uint8Array([137, 80, 78, 71])], 'receipt.png', { type: 'image/png' }));
+    form.append(
+      'receipt',
+      new File(
+        [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])],
+        'receipt.png',
+        { type: 'image/png' }
+      )
+    );
 
     const evRes = await app.request(
       `http://localhost:3000/api/payments/${orderData.orderNumber}/evidence`,
@@ -340,7 +396,7 @@ test('SELLORA end-to-end commerce, RBAC, tracking, payment review, and email que
 
 test('Owner authentication supports Google OAuth and Email+Password resolving to the same account, blocks hijacks, and isolates non-owner emails', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
     adminNotificationEmail: 'alerts@sellora.test',
     googleClientId: '1234567890-mock.apps.googleusercontent.com',
     googleClientSecret: 'mock-google-client-secret',
@@ -354,7 +410,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: 'Hijack Attempt',
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         password: 'AttackerPassword123!',
       }),
     });
@@ -401,7 +457,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
     const unverifiedOwnerTry = await authCtx.internalAdapter.createUser(
       {
         name: 'Unverified Try',
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         emailVerified: false,
       },
       { method: 'oauth', oauth: { providerId: 'google' } }
@@ -419,11 +475,11 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
     // Clean up unverified test user before simulating real verified Google OAuth owner login
     await rt.db.run(`DELETE FROM user WHERE id = ?`, [unverifiedOwnerTry.id]);
 
-    // 5. Verified Google OAuth sign-in for olarindevictor3@gmail.com authorizes owner automatically
+    // 5. Verified Google OAuth sign-in for olarindevictor046@gmail.com authorizes owner automatically
     const verifiedOwnerUser = await authCtx.internalAdapter.createUser(
       {
         name: 'Victor Olarinde',
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         emailVerified: true,
       },
       { method: 'oauth', oauth: { providerId: 'google' } }
@@ -436,7 +492,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
 
     const ownerRowAfterGoogle = await rt.db.get<{ id: string; role: string; emailVerified: number }>(
       `SELECT id, role, emailVerified FROM user WHERE email = ?`,
-      ['olarindevictor3@gmail.com']
+      ['olarindevictor046@gmail.com']
     );
     assert.equal(ownerRowAfterGoogle?.id, verifiedOwnerUser.id);
     assert.equal(ownerRowAfterGoogle?.role, 'owner');
@@ -445,7 +501,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
     // 6. Adding Email & Password to that same Google-created owner resolves to the SAME user.id
     const addPwdRes = await provisionOwnerInDb(rt.db, {
       name: 'Victor Olarinde',
-      email: 'olarindevictor3@gmail.com',
+      email: 'olarindevictor046@gmail.com',
       password: 'OwnerUnifiedPassword123!',
       addPasswordIfMissing: true,
     });
@@ -457,7 +513,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         password: 'WrongPassword123!',
       }),
     });
@@ -468,7 +524,7 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         password: 'OwnerUnifiedPassword123!',
       }),
     });
@@ -480,9 +536,9 @@ test('Owner authentication supports Google OAuth and Email+Password resolving to
     assert.equal(meOwner.user.id, verifiedOwnerUser.id);
     assert.equal(meOwner.user.role, 'owner');
 
-    // Ensure no duplicate user records exist for olarindevictor3@gmail.com
+    // Ensure no duplicate user records exist for olarindevictor046@gmail.com
     const dupCount = await rt.db.get<{ cnt: number }>(
-      `SELECT COUNT(*) as cnt FROM user WHERE LOWER(email) = 'olarindevictor3@gmail.com'`
+      `SELECT COUNT(*) as cnt FROM user WHERE LOWER(email) = 'olarindevictor046@gmail.com'`
     );
     assert.equal(dupCount?.cnt, 1);
 
@@ -503,7 +559,7 @@ test('RBAC role isolation across owner, admin, staff, and customer', async () =>
     await seedInitialStoreData(rt.db);
 
     const { cookie: ownerCookie } = await provisionAndSignInOwner(rt, {
-      email: 'olarindevictor3@gmail.com',
+      email: 'olarindevictor046@gmail.com',
       password: 'StrongPassword123!',
     });
 
@@ -597,7 +653,7 @@ test('RBAC role isolation across owner, admin, staff, and customer', async () =>
 
     // Staff row cannot be promoted to owner, and owner row cannot be modified via staff API
     const staffRow = await rt.db.get<{ id: string }>(`SELECT id FROM user WHERE email = ?`, ['staff@sellora.test']);
-    const ownerRow = await rt.db.get<{ id: string }>(`SELECT id FROM user WHERE email = ?`, ['olarindevictor3@gmail.com']);
+    const ownerRow = await rt.db.get<{ id: string }>(`SELECT id FROM user WHERE email = ?`, ['olarindevictor046@gmail.com']);
     assert.equal(
       (
         await rt.app.request(`http://localhost:3000/api/admin/staff/${staffRow!.id}`, {
@@ -663,7 +719,7 @@ test('Google OAuth provider config, real redirect URL generation, callback error
 
     // Role preservation check for existing owner vs ordinary customer session resolution
     const { cookie: ownerCookie } = await provisionAndSignInOwner(rtGoogle, {
-      email: 'olarindevictor3@gmail.com',
+      email: 'olarindevictor046@gmail.com',
       password: 'StrongPassword123!',
     });
     const resolvedOwner = await getSessionUser(
@@ -723,7 +779,7 @@ test('Cloudflare Turnstile server verification rejects missing, invalid, and rep
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '10.0.0.5' },
       body: JSON.stringify({
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         password: 'StrongPassword123!',
         turnstileToken: 'bad-token',
       }),
@@ -768,7 +824,7 @@ test('Cloudflare D1 adapter executes Better Auth + Hono commerce routes end-to-e
     const storage = createLocalStorage(path.join(tmpDir, 'r2'));
     const env: AppEnvConfig = {
       betterAuthSecret: 'test-secret-012345678901234567890123456789',
-      ownerEmail: 'olarindevictor3@gmail.com',
+      ownerEmail: 'olarindevictor046@gmail.com',
       appUrl: 'https://sellora-test.workers.dev',
     };
 
@@ -788,7 +844,7 @@ test('Cloudflare D1 adapter executes Better Auth + Hono commerce routes end-to-e
 
     const { cookie: ownerCookie } = await provisionAndSignInOwner(
       { app, db: d1Db },
-      { email: 'olarindevictor3@gmail.com', password: 'StrongPassword123!' }
+      { email: 'olarindevictor046@gmail.com', password: 'StrongPassword123!' }
     );
 
     const addZone = await app.request('https://sellora-test.workers.dev/api/admin/delivery-zones', {
@@ -922,9 +978,9 @@ test('Brevo transactional email outbox enforces idempotency keys and records pro
   }
 });
 
-test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth linking share one account and fallback admin notification email', async () => {
+test('Designated owner olarindevictor046@gmail.com Email+Password and Google OAuth linking share one account and notification email defaults to olarindevictor046@gmail.com', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
     googleClientId: '1234567890-mock.apps.googleusercontent.com',
     googleClientSecret: 'mock-google-client-secret',
   });
@@ -932,7 +988,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
     await seedInitialStoreData(rt.db);
 
     const effEmail = await getEffectiveEmailConfig(rt.db, rt.env);
-    assert.equal(effEmail.adminNotificationEmail, 'olarindevictor3@gmail.com');
+    assert.equal(effEmail.adminNotificationEmail, 'olarindevictor046@gmail.com');
 
     // Ordinary customer signup with forged owner role stays customer
     const custRes = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
@@ -955,7 +1011,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
     // Provision owner with Email & Password, verify Google account links to SAME user.id without overwriting password
     const prov = await provisionOwnerInDb(rt.db, {
       name: 'Victor Olarinde',
-      email: 'olarindevictor3@gmail.com',
+      email: 'olarindevictor046@gmail.com',
       password: 'OwnerPassword123!',
     });
     assert.equal(prov.status, 'created');
@@ -963,7 +1019,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
     // Re-provisioning refuses silently overwriting existing password
     const secondProv = await provisionOwnerInDb(rt.db, {
       name: 'Victor Olarinde',
-      email: 'olarindevictor3@gmail.com',
+      email: 'olarindevictor046@gmail.com',
       password: 'NewPassword999!',
       addPasswordIfMissing: true,
     });
@@ -974,7 +1030,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'olarindevictor3@gmail.com',
+        email: 'olarindevictor046@gmail.com',
         password: 'OwnerPassword123!',
       }),
     });
@@ -984,7 +1040,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
       await rt.app.request('http://localhost:3000/api/me', { headers: { Cookie: newOwnerCookie } })
     ).json();
     assert.equal(meOwner.user.role, 'owner');
-    assert.equal(meOwner.user.email, 'olarindevictor3@gmail.com');
+    assert.equal(meOwner.user.email, 'olarindevictor046@gmail.com');
     assert.equal(meOwner.user.id, prov.userId);
   } finally {
     fs.rmSync(rt.tmpDir, { recursive: true, force: true });
@@ -993,7 +1049,7 @@ test('Designated owner olarindevictor3@gmail.com Email+Password and Google OAuth
 
 test('SEO endpoints (robots.txt, sitemap.xml, meta injection, noindex on private paths) and product/category SEO persistence', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
     googleSiteVerification: 'gsc-verify-token-abc123',
     gaMeasurementId: 'G-SELLORA99',
   });
@@ -1084,7 +1140,7 @@ test('SEO endpoints (robots.txt, sitemap.xml, meta injection, noindex on private
 
 test('First-party privacy-safe analytics collection, expanded settings summary, and owner session revocation', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
   });
   try {
     await seedInitialStoreData(rt.db);
@@ -1134,17 +1190,19 @@ test('First-party privacy-safe analytics collection, expanded settings summary, 
     assert.equal(analyticsRes.insights.trafficSources[0].source, 'search');
     assert.equal(analyticsRes.insights.deviceCategories[0].device, 'mobile');
 
-    // Settings summary contains ownerSummary & integrationStatus without any bootstrap secret fields
+    // Settings summary contains ownerSummary & clean emailStatus without bootstrap secrets or infrastructure leaks
     const settingsRes = await (
       await rt.app.request('http://localhost:3000/api/admin/settings', {
         headers: { Cookie: ownerCookie },
       })
     ).json();
-    assert.equal(settingsRes.ownerSummary.designatedOwnerEmail, 'olarindevictor3@gmail.com');
+    assert.equal(settingsRes.ownerSummary.designatedOwnerEmail, 'olarindevictor046@gmail.com');
     assert.equal(settingsRes.ownerSummary.ownerExists, true);
     assert.deepEqual(settingsRes.ownerSummary.authMethods, ['google', 'email_password']);
     assert.equal(settingsRes.ownerSummary.bootstrapConfigured, undefined);
-    assert.ok(Array.isArray(settingsRes.integrationStatus) && settingsRes.integrationStatus.length >= 6);
+    assert.equal(settingsRes.integrationStatus, undefined);
+    assert.equal(settingsRes.emailStatus.hasBrevoApiKey, undefined);
+    assert.equal(typeof settingsRes.emailStatus.notificationServiceReady, 'boolean');
 
     // Owner sessions list & revoke
     const sessRes = await (
@@ -1160,7 +1218,7 @@ test('First-party privacy-safe analytics collection, expanded settings summary, 
 
 test('Analytics handles empty database safely, separates confirmed vs unconfirmed revenue, and computes breakdowns accurately', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
   });
   try {
     await seedInitialStoreData(rt.db);
@@ -1232,7 +1290,14 @@ test('Analytics handles empty database safely, separates confirmed vs unconfirme
     evForm.append('referenceNumber', 'NIP-112233');
     evForm.append('amountNaira', String(ord1.totalKobo / 100));
     evForm.append('transferDate', '2026-11-14');
-    evForm.append('receipt', new File([new Uint8Array([137, 80, 78, 71])], 'r.png', { type: 'image/png' }));
+    evForm.append(
+      'receipt',
+      new File(
+        [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])],
+        'r.png',
+        { type: 'image/png' }
+      )
+    );
     const evUpload = await rt.app.request(`http://localhost:3000/api/payments/${ord1.orderNumber}/evidence`, {
       method: 'POST',
       headers: { Cookie: cookieA },
@@ -1312,7 +1377,7 @@ test('Analytics handles empty database safely, separates confirmed vs unconfirme
 
 test('SSR SEO returns crawlable product/legal HTML + JSON-LD and genuine HTTP 404 on missing pages', async () => {
   const rt = createTestRuntime({
-    ownerEmail: 'olarindevictor3@gmail.com',
+    ownerEmail: 'olarindevictor046@gmail.com',
   });
   try {
     await seedInitialStoreData(rt.db);
@@ -1470,3 +1535,2777 @@ test('Optional integrations (GOOGLE_SITE_VERIFICATION, Turnstile keys, VITE_GA_M
     fs.rmSync(rtSecretOnly.tmpDir, { recursive: true, force: true });
   }
 });
+
+// =====================================================================
+// STAGE 2 SEPARATED TEST SUITES (1–8)
+// Note: SQLite / in-memory D1 shim tests prove SQL trigger invariants,
+// statement atomicity, and rollback semantics in local single-connection
+// execution; they do NOT simulate distributed edge D1 multi-isolate races.
+// =====================================================================
+
+async function setupCommerceFixture(opts: { useD1Shim?: boolean } = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sellora-s2-'));
+  const migrationsDir = path.resolve(process.cwd(), 'migrations');
+  const mockD1 = opts.useD1Shim ? createInMemoryD1Shim(migrationsDir) : null;
+  const db = mockD1
+    ? createD1Db(mockD1)
+    : createSqliteDb(path.join(tmpDir, 'test.db'), migrationsDir);
+  const storage = createLocalStorage(path.join(tmpDir, 'r2'));
+  const env: AppEnvConfig = {
+    betterAuthSecret: 'test-secret-012345678901234567890123456789',
+    ownerEmail: 'olarindevictor046@gmail.com',
+    appUrl: 'http://localhost:3000',
+  };
+  await seedInitialStoreData(db);
+  const auth = createSelloraAuth({
+    database: mockD1 || db.rawSqlite!,
+    db,
+    baseURL: env.appUrl!,
+    secret: env.betterAuthSecret,
+    emailEnv: env,
+    ownerEmail: env.ownerEmail,
+  });
+  const app = createSelloraApiApp({ db, storage, auth, env });
+
+  const { cookie: ownerCookie } = await provisionAndSignInOwner(
+    { app, db },
+    { email: 'olarindevictor046@gmail.com', password: 'StrongOwnerPassword123!' }
+  );
+
+  const dzRes = await app.request('http://localhost:3000/api/admin/delivery-zones', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+    body: JSON.stringify({
+      state: 'Lagos',
+      lga: 'Ikeja',
+      feeNaira: 2500,
+      estimatedDaysMin: 1,
+      estimatedDaysMax: 2,
+      isEnabled: true,
+    }),
+  });
+  assert.equal(dzRes.status, 201);
+  const dzJson = await dzRes.json();
+
+  const custSignUp = await app.request('http://localhost:3000/api/auth/sign-up/email', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Stage2 Shopper',
+      email: 'shopper@sellora.test',
+      password: 'ShopperPassword123!',
+    }),
+  });
+  assert.equal(custSignUp.status, 200);
+  const custCookie = custSignUp.headers.get('set-cookie')!.split(';')[0];
+
+  const prodRes = await (await app.request('http://localhost:3000/api/products')).json();
+  return {
+    tmpDir,
+    db,
+    mockD1,
+    storage,
+    app,
+    ownerCookie,
+    custCookie,
+    zoneId: dzJson.id as string,
+    products: prodRes.products as any[],
+  };
+}
+
+describe('Suite 1: SQLite Unit Tests (Migration 0004 Triggers, ISO Timestamps & Batch Semantics)', () => {
+  test('enforces coupon starts_at, expires_at, NULL bounds, max_uses, and is_active without blocking admin toggle', async () => {
+    const rt = createTestRuntime();
+    try {
+      await seedInitialStoreData(rt.db);
+      const now = Date.now();
+      const pastIso = new Date(now - 3_600_000).toISOString();
+      const futureIso = new Date(now + 3_600_000).toISOString();
+
+      await rt.db.batch([
+        {
+          sql: `INSERT INTO coupons (id, code, discount_type, discount_value, min_spend_kobo, max_uses, used_count, starts_at, expires_at, is_active, created_at)
+                VALUES ('c_future', 'FUTURE', 'fixed', 10000, 0, NULL, 0, ?, NULL, 1, ?)`,
+          params: [futureIso, new Date().toISOString()],
+        },
+        {
+          sql: `INSERT INTO coupons (id, code, discount_type, discount_value, min_spend_kobo, max_uses, used_count, starts_at, expires_at, is_active, created_at)
+                VALUES ('c_expired', 'EXPIRED', 'fixed', 10000, 0, NULL, 0, NULL, ?, 1, ?)`,
+          params: [pastIso, new Date().toISOString()],
+        },
+        {
+          sql: `INSERT INTO coupons (id, code, discount_type, discount_value, min_spend_kobo, max_uses, used_count, starts_at, expires_at, is_active, created_at)
+                VALUES ('c_unlimited', 'OPENALL', 'fixed', 10000, 0, NULL, 0, NULL, NULL, 1, ?)`,
+          params: [new Date().toISOString()],
+        },
+        {
+          sql: `INSERT INTO coupons (id, code, discount_type, discount_value, min_spend_kobo, max_uses, used_count, starts_at, expires_at, is_active, created_at)
+                VALUES ('c_limited', 'CAP2', 'fixed', 10000, 0, 2, 0, ?, ?, 1, ?)`,
+          params: [pastIso, futureIso, new Date().toISOString()],
+        },
+      ]);
+
+      await assert.rejects(
+        () => rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_future'`),
+        (err) => extractDbGuardCode(err) === 'COUPON_NOT_STARTED'
+      );
+      await assert.rejects(
+        () => rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_expired'`),
+        (err) => extractDbGuardCode(err) === 'COUPON_EXPIRED'
+      );
+
+      // NULL starts_at, NULL expires_at, NULL max_uses increments cleanly multiple times
+      await rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_unlimited'`);
+      await rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_unlimited'`);
+      const unlim = await rt.db.get<{ used_count: number }>(`SELECT used_count FROM coupons WHERE id = 'c_unlimited'`);
+      assert.equal(unlim?.used_count, 2);
+
+      // Admin deactivation works even if coupon already has NULLs or usages
+      await rt.db.run(`UPDATE coupons SET is_active = 0 WHERE id = 'c_unlimited'`);
+      await assert.rejects(
+        () => rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_unlimited'`),
+        (err) => extractDbGuardCode(err) === 'COUPON_INACTIVE'
+      );
+
+      // max_uses = 2 permits 2 increments and aborts on 3rd
+      await rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_limited'`);
+      await rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_limited'`);
+      await assert.rejects(
+        () => rt.db.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_limited'`),
+        (err) => extractDbGuardCode(err) === 'COUPON_LIMIT_EXCEEDED'
+      );
+
+      // Batch rollback verified on stock trigger
+      const v = await rt.db.get<{ id: string; stock_quantity: number }>(
+        `SELECT id, stock_quantity FROM product_variants LIMIT 1`
+      );
+      assert.ok(v);
+      await assert.rejects(
+        () =>
+          rt.db.batch([
+            { sql: `UPDATE coupons SET used_count = used_count + 1 WHERE id = 'c_future'`, params: [] },
+          ]),
+        /COUPON_NOT_STARTED/
+      );
+      await assert.rejects(
+        () =>
+          rt.db.batch([
+            {
+              sql: `UPDATE product_variants SET stock_quantity = stock_quantity - ? WHERE id = ?`,
+              params: [v!.stock_quantity + 1, v!.id],
+            },
+          ]),
+        (err) => extractDbGuardCode(err) === 'INSUFFICIENT_STOCK'
+      );
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 2: D1 Adapter Tests (createD1Db Batch Contract & meta.changes Mapping)', () => {
+  test('calls d1.prepare/bind once per statement, sends single d1.batch, and maps meta.changes safely', async () => {
+    const batchCalls: number[] = [];
+    const preparedSqls: string[] = [];
+    const boundValues: unknown[][] = [];
+
+    const spyD1: D1LikeDatabase = {
+      prepare(sql: string) {
+        preparedSqls.push(sql);
+        const makeBound = (vals: unknown[]): D1PreparedStatementLike => ({
+          bind(...args: unknown[]) {
+            boundValues.push(args);
+            return makeBound(args);
+          },
+          async all() {
+            return { results: [] };
+          },
+          async first() {
+            return null;
+          },
+          async run() {
+            return { meta: { changes: 1 } };
+          },
+        });
+        return makeBound([]);
+      },
+      async exec() {
+        return {};
+      },
+      async batch<T = unknown>(stmts: D1PreparedStatementLike[]): Promise<T[]> {
+        batchCalls.push(stmts.length);
+        return [{ meta: { changes: 2 } }, {}] as T[];
+      },
+    };
+
+    const d1Db = createD1Db(spyD1);
+    assert.deepEqual(await d1Db.batch([]), []);
+    assert.equal(batchCalls.length, 0);
+
+    const res = await d1Db.batch([
+      { sql: 'UPDATE t SET a = ? WHERE id = ?', params: [1, 'x'] },
+      { sql: 'DELETE FROM t', params: [] },
+    ]);
+
+    assert.deepEqual(batchCalls, [2]);
+    assert.deepEqual(preparedSqls, ['UPDATE t SET a = ? WHERE id = ?', 'DELETE FROM t']);
+    assert.deepEqual(boundValues, [[1, 'x']]);
+    assert.deepEqual(res, [{ changes: 2 }, { changes: 0 }]);
+  });
+});
+
+describe('Suite 3: D1 Integration Tests (Transactional D1 Shim End-to-End)', () => {
+  test('rolls back D1 batch atomically on mid-batch constraint failure and executes full D1 payment/address flow', async () => {
+    const fx = await setupCommerceFixture({ useD1Shim: true });
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+      const startStock = v1.stock_quantity;
+
+      // Direct D1 batch rollback proof: statement 1 modifies stock, statement 2 violates stock trigger -> statement 1 rolls back
+      await assert.rejects(() =>
+        fx.db.batch([
+          { sql: `UPDATE product_variants SET stock_quantity = stock_quantity - 2 WHERE id = ?`, params: [v1.id] },
+          { sql: `UPDATE product_variants SET stock_quantity = -1 WHERE id = ?`, params: [v1.id] },
+        ])
+      );
+      const afterAbort = await fx.db.get<{ stock_quantity: number }>(
+        `SELECT stock_quantity FROM product_variants WHERE id = ?`,
+        [v1.id]
+      );
+      assert.equal(afterAbort?.stock_quantity, startStock);
+
+      // Customer address default switch + checkout + payment evidence + verify through D1 adapter
+      const a1 = await fx.app.request('http://localhost:3000/api/addresses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie },
+        body: JSON.stringify({
+          fullName: 'Stage2 Shopper',
+          email: 'shopper@sellora.test',
+          phone: '08031234567',
+          state: 'Lagos',
+          lga: 'Ikeja',
+          city: 'Ikeja',
+          streetAddress: '10 Allen Ave',
+        }),
+      });
+      assert.equal(a1.status, 201);
+
+      const a2 = await fx.app.request('http://localhost:3000/api/addresses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie },
+        body: JSON.stringify({
+          fullName: 'Stage2 Shopper Office',
+          email: 'shopper@sellora.test',
+          phone: '08031234567',
+          state: 'Lagos',
+          lga: 'Ikeja',
+          city: 'Ikeja',
+          streetAddress: '20 Oba Akran',
+          isDefault: true,
+        }),
+      });
+      assert.equal(a2.status, 201);
+      const addrs = await (
+        await fx.app.request('http://localhost:3000/api/addresses', {
+          headers: { Cookie: fx.custCookie },
+        })
+      ).json();
+      assert.equal(addrs.addresses.filter((a: any) => a.is_default === 1).length, 1);
+
+      // Deleted address PATCH with isDefault: true MUST NOT clear user's active default
+      const patchMissing = await fx.app.request('http://localhost:3000/api/addresses/addr_missing', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie },
+        body: JSON.stringify({ isDefault: true }),
+      });
+      assert.equal(patchMissing.status, 404);
+      const addrsAfterMissingPatch = await (
+        await fx.app.request('http://localhost:3000/api/addresses', {
+          headers: { Cookie: fx.custCookie },
+        })
+      ).json();
+      assert.equal(addrsAfterMissingPatch.addresses.filter((a: any) => a.is_default === 1).length, 1);
+
+      // End-to-end checkout on D1 shim
+      const chk = await fx.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: fx.custCookie,
+          'x-forwarded-for': '10.0.3.1',
+        },
+        body: JSON.stringify({
+          items: [{ productId: p1.id, variantId: v1.id, quantity: 2 }],
+          address: {
+            fullName: 'Stage2 Shopper',
+            email: 'shopper@sellora.test',
+            phone: '08031234567',
+            state: 'Lagos',
+            lga: 'Ikeja',
+            city: 'Ikeja',
+            streetAddress: '10 Allen Ave',
+          },
+          idempotencyKey: 'd1_int_chk_1',
+        }),
+      });
+      assert.equal(chk.status, 201);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 4: Checkout Rollback Tests (Stock, Zone, Coupon, Duplicate Lines)', () => {
+  test('rolls back item 1 stock, coupon, and cart if item 2 has insufficient stock, bad zone, bad coupon, or duplicated SKU exceeds stock', async () => {
+    const fx = await setupCommerceFixture();
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+      const p2 = fx.products[1];
+      const v2 = p2.variants[0];
+      const initV1 = v1.stock_quantity;
+      const initV2 = v2.stock_quantity;
+
+      // Save customer cart to verify rollback preserves cart
+      await fx.app.request('http://localhost:3000/api/cart', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie },
+        body: JSON.stringify({
+          items: [
+            { productId: p1.id, variantId: v1.id, quantity: 2 },
+            { productId: p2.id, variantId: v2.id, quantity: initV2 + 5 },
+          ],
+        }),
+      });
+
+      // Create valid coupon
+      await fx.app.request('http://localhost:3000/api/admin/coupons', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          code: 'SAVE10',
+          discountType: 'percentage',
+          discountValue: 10,
+          maxUses: 5,
+        }),
+      });
+
+      // 1. Item 2 out of stock -> full rollback
+      const failStock = await fx.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie, 'x-forwarded-for': '10.0.4.1' },
+        body: JSON.stringify({
+          items: [
+            { productId: p1.id, variantId: v1.id, quantity: 2 },
+            { productId: p2.id, variantId: v2.id, quantity: initV2 + 5 },
+          ],
+          couponCode: 'SAVE10',
+          address: {
+            fullName: 'Stage2 Shopper',
+            email: 'shopper@sellora.test',
+            phone: '08031234567',
+            state: 'Lagos',
+            lga: 'Ikeja',
+            city: 'Ikeja',
+            streetAddress: '10 Allen Ave',
+          },
+        }),
+      });
+      assert.equal(failStock.status, 400);
+
+      // 2. Duplicate lines summing above stock (e.g. half + 1 twice) -> rejected & rolled back
+      const halfPlus = Math.floor(initV1 / 2) + 2;
+      const failDup = await fx.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie, 'x-forwarded-for': '10.0.4.2' },
+        body: JSON.stringify({
+          items: [
+            { productId: p1.id, variantId: v1.id, quantity: halfPlus },
+            { productId: p1.id, variantId: v1.id, quantity: halfPlus },
+          ],
+          address: {
+            fullName: 'Stage2 Shopper',
+            email: 'shopper@sellora.test',
+            phone: '08031234567',
+            state: 'Lagos',
+            lga: 'Ikeja',
+            city: 'Ikeja',
+            streetAddress: '10 Allen Ave',
+          },
+        }),
+      });
+      assert.equal(failDup.status, 400);
+
+      // 3. Invalid / disabled delivery zone -> zero deductions
+      const failZone = await fx.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie, 'x-forwarded-for': '10.0.4.3' },
+        body: JSON.stringify({
+          items: [{ productId: p1.id, variantId: v1.id, quantity: 1 }],
+          address: {
+            fullName: 'Stage2 Shopper',
+            email: 'shopper@sellora.test',
+            phone: '08031234567',
+            state: 'Rivers',
+            lga: 'Obio-Akpor',
+            city: 'Port Harcourt',
+            streetAddress: '12 Aba Road',
+          },
+        }),
+      });
+      assert.equal(failZone.status, 400);
+
+      // 4. Future startsAt coupon & expired coupon -> zero deductions
+      await fx.app.request('http://localhost:3000/api/admin/coupons', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          code: 'NOTYET',
+          discountType: 'fixed',
+          discountValue: 1000,
+          startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+        }),
+      });
+      const failStart = await fx.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.custCookie, 'x-forwarded-for': '10.0.4.4' },
+        body: JSON.stringify({
+          items: [{ productId: p1.id, variantId: v1.id, quantity: 1 }],
+          couponCode: 'NOTYET',
+          address: {
+            fullName: 'Stage2 Shopper',
+            email: 'shopper@sellora.test',
+            phone: '08031234567',
+            state: 'Lagos',
+            lga: 'Ikeja',
+            city: 'Ikeja',
+            streetAddress: '10 Allen Ave',
+          },
+        }),
+      });
+      assert.equal(failStart.status, 400);
+
+      // Verify zero side effects across DB
+      const v1Now = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v1.id]);
+      const v2Now = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v2.id]);
+      const orderCnt = await fx.db.get<{ cnt: number }>(`SELECT COUNT(*) as cnt FROM orders`);
+      const movCnt = await fx.db.get<{ cnt: number }>(`SELECT COUNT(*) as cnt FROM inventory_movements`);
+      const couponUsed = await fx.db.get<{ used_count: number }>(`SELECT used_count FROM coupons WHERE code = 'SAVE10'`);
+      const cartRes = await (await fx.app.request('http://localhost:3000/api/cart', { headers: { Cookie: fx.custCookie } })).json();
+
+      assert.equal(v1Now?.stock_quantity, initV1);
+      assert.equal(v2Now?.stock_quantity, initV2);
+      assert.equal(orderCnt?.cnt, 0);
+      assert.equal(movCnt?.cnt, 0);
+      assert.equal(couponUsed?.used_count, 0);
+      assert.equal(cartRes.items.length, 2);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 5: Coupon Concurrency Tests (Local SQLite Serialization Guard Verification)', () => {
+  test('never exceeds coupon max_uses under concurrent Promise.all checkout bursts and preserves stock on losers', async () => {
+    const fx = await setupCommerceFixture({ useD1Shim: true });
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+      const initialStock = v1.stock_quantity;
+
+      await fx.app.request('http://localhost:3000/api/admin/coupons', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          code: 'RACE2',
+          discountType: 'fixed',
+          discountValue: 5000,
+          maxUses: 2,
+          expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        }),
+      });
+
+      const attempts = Array.from({ length: 6 }, (_, i) =>
+        fx.app.request('http://localhost:3000/api/checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: fx.custCookie,
+            'x-forwarded-for': `10.0.5.${i + 1}`,
+          },
+          body: JSON.stringify({
+            items: [{ productId: p1.id, variantId: v1.id, quantity: 1 }],
+            couponCode: 'RACE2',
+            idempotencyKey: `coupon_race_${i}`,
+            address: {
+              fullName: 'Stage2 Shopper',
+              email: 'shopper@sellora.test',
+              phone: '08031234567',
+              state: 'Lagos',
+              lga: 'Ikeja',
+              city: 'Ikeja',
+              streetAddress: '10 Allen Ave',
+            },
+          }),
+        })
+      );
+
+      const responses = await Promise.all(attempts);
+      const successes = responses.filter((r) => r.status === 201);
+      const failures = responses.filter((r) => r.status === 400);
+      assert.equal(successes.length, 2);
+      assert.equal(failures.length, 4);
+
+      const coupon = await fx.db.get<{ used_count: number }>(`SELECT used_count FROM coupons WHERE code = 'RACE2'`);
+      const v1Now = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v1.id]);
+      const orderCnt = await fx.db.get<{ cnt: number }>(`SELECT COUNT(*) as cnt FROM orders`);
+
+      assert.equal(coupon?.used_count, 2);
+      assert.equal(v1Now?.stock_quantity, initialStock - 2);
+      assert.equal(orderCnt?.cnt, 2);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 6: Inventory & Payment Review Concurrency Tests', () => {
+  test('prevents overselling, preserves relative admin inventory adjustments, and deduplicates concurrent payment verify/evidence', async () => {
+    const fx = await setupCommerceFixture({ useD1Shim: true });
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+      // Set exact stock to 3
+      await fx.db.run(`UPDATE product_variants SET stock_quantity = 3 WHERE id = ?`, [v1.id]);
+
+      // 5 concurrent checkouts each requesting 2 units -> only 1 can succeed (leaves 1 unit)
+      const stockRace = await Promise.all(
+        Array.from({ length: 5 }, (_, i) =>
+          fx.app.request('http://localhost:3000/api/checkout', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Cookie: fx.custCookie,
+              'x-forwarded-for': `10.0.6.${i + 1}`,
+            },
+            body: JSON.stringify({
+              items: [{ productId: p1.id, variantId: v1.id, quantity: 2 }],
+              idempotencyKey: `stock_race_${i}`,
+              address: {
+                fullName: 'Stage2 Shopper',
+                email: 'shopper@sellora.test',
+                phone: '08031234567',
+                state: 'Lagos',
+                lga: 'Ikeja',
+                city: 'Ikeja',
+                streetAddress: '10 Allen Ave',
+              },
+            }),
+          })
+        )
+      );
+      const winners = stockRace.filter((r) => r.status === 201);
+      assert.equal(winners.length, 1);
+      const winningOrder = await winners[0].json();
+
+      // Concurrent checkout (1 unit) + admin adjustment (+5 units) -> final stock must be 1 - 1 + 5 = 5
+      const [chkWin, adjWin] = await Promise.all([
+        fx.app.request('http://localhost:3000/api/checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: fx.custCookie,
+            'x-forwarded-for': '10.0.6.10',
+          },
+          body: JSON.stringify({
+            items: [{ productId: p1.id, variantId: v1.id, quantity: 1 }],
+            idempotencyKey: 'stock_chk_adj_race',
+            address: {
+              fullName: 'Stage2 Shopper',
+              email: 'shopper@sellora.test',
+              phone: '08031234567',
+              state: 'Lagos',
+              lga: 'Ikeja',
+              city: 'Ikeja',
+              streetAddress: '10 Allen Ave',
+            },
+          }),
+        }),
+        fx.app.request('http://localhost:3000/api/admin/inventory/adjust', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+          body: JSON.stringify({ variantId: v1.id, changeAmount: 5, reason: 'Restock batch' }),
+        }),
+      ]);
+      assert.equal(chkWin.status, 201);
+      assert.equal(adjWin.status, 200);
+
+      const finalVar = await fx.db.get<{ stock_quantity: number }>(
+        `SELECT stock_quantity FROM product_variants WHERE id = ?`,
+        [v1.id]
+      );
+      const movSum = await fx.db.get<{ total_delta: number }>(
+        `SELECT SUM(change_amount) as total_delta FROM inventory_movements WHERE variant_id = ?`,
+        [v1.id]
+      );
+      assert.equal(finalVar?.stock_quantity, 5);
+      assert.equal(3 + (movSum?.total_delta ?? 0), 5);
+
+      // Concurrent double payment verification -> exactly 1 payment_confirmed history row & 1 audit log
+      const [verA, verB] = await Promise.all([
+        fx.app.request(`http://localhost:3000/api/admin/payments/${winningOrder.orderId}/verify`, {
+          method: 'POST',
+          headers: { Cookie: fx.ownerCookie },
+        }),
+        fx.app.request(`http://localhost:3000/api/admin/payments/${winningOrder.orderId}/verify`, {
+          method: 'POST',
+          headers: { Cookie: fx.ownerCookie },
+        }),
+      ]);
+      assert.equal(verA.status, 200);
+      assert.equal(verB.status, 200);
+
+      const confirmHistoryCount = await fx.db.get<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt FROM order_status_history WHERE order_id = ? AND new_status = 'payment_confirmed'`,
+        [winningOrder.orderId]
+      );
+      const verifyAuditCount = await fx.db.get<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt FROM audit_logs WHERE action = 'PAYMENT_VERIFIED' AND target_id = ?`,
+        [winningOrder.orderId]
+      );
+      assert.equal(confirmHistoryCount?.cnt, 1);
+      assert.equal(verifyAuditCount?.cnt, 1);
+
+      // Rejecting an already confirmed payment is blocked (409)
+      const rejectAfterConfirm = await fx.app.request(
+        `http://localhost:3000/api/admin/payments/${winningOrder.orderId}/reject`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+          body: JSON.stringify({ reason: 'Late reject attempt' }),
+        }
+      );
+      assert.equal(rejectAfterConfirm.status, 409);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 7: POS & Admin Inventory Adjustment Tests', () => {
+  test('POS rolls back multi-item failures, aggregates duplicate SKUs, honors track_inventory=0, and blocks negative stock adjustments', async () => {
+    const fx = await setupCommerceFixture();
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+      const p2 = fx.products[1];
+      const v2 = p2.variants[0];
+      const init1 = v1.stock_quantity;
+      const init2 = v2.stock_quantity;
+
+      // POS fails cleanly on item 2 -> item 1 stock untouched
+      const posFail = await fx.app.request('http://localhost:3000/api/admin/pos/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          items: [
+            { productId: p1.id, variantId: v1.id, quantity: 1 },
+            { productId: p2.id, variantId: v2.id, quantity: init2 + 10 },
+          ],
+          markPaid: true,
+        }),
+      });
+      assert.equal(posFail.status, 400);
+      const v1Check = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v1.id]);
+      assert.equal(v1Check?.stock_quantity, init1);
+
+      // Admin manual negative inventory adjustment past 0 aborts and writes zero movements
+      const negAdj = await fx.app.request('http://localhost:3000/api/admin/inventory/adjust', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({ variantId: v1.id, changeAmount: -(init1 + 5), reason: 'Invalid drop' }),
+      });
+      assert.equal(negAdj.status, 400);
+      const movs = await fx.db.get<{ cnt: number }>(`SELECT COUNT(*) as cnt FROM inventory_movements`);
+      assert.equal(movs?.cnt, 0);
+
+      // Non-tracked product can sell on POS with 0 stock
+      await fx.db.run(`UPDATE products SET track_inventory = 0 WHERE id = ?`, [p2.id]);
+      await fx.db.run(`UPDATE product_variants SET stock_quantity = 0 WHERE id = ?`, [v2.id]);
+      const posUntracked = await fx.app.request('http://localhost:3000/api/admin/pos/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          items: [
+            { productId: p1.id, variantId: v1.id, quantity: 1 },
+            { productId: p1.id, variantId: v1.id, quantity: 1 },
+            { productId: p2.id, variantId: v2.id, quantity: 3 },
+          ],
+          markPaid: true,
+        }),
+      });
+      assert.equal(posUntracked.status, 201);
+      const posData = await posUntracked.json();
+      assert.ok(posData.orderNumber.startsWith('POS-'));
+
+      const v1AfterPos = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v1.id]);
+      const v2AfterPos = await fx.db.get<{ stock_quantity: number }>(`SELECT stock_quantity FROM product_variants WHERE id = ?`, [v2.id]);
+      assert.equal(v1AfterPos?.stock_quantity, init1 - 2);
+      assert.equal(v2AfterPos?.stock_quantity, 0);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Suite 8: Failure-Injection Tests (Mid-Batch Failure, R2 Rollback Delete & Orphan Reconciliation)', () => {
+  test('deletes uploaded receipt when DB batch aborts after storage.put, and recovers via storage_orphan_records when delete fails', async () => {
+    const fx = await setupCommerceFixture({ useD1Shim: true });
+    try {
+      const p1 = fx.products[0];
+      const v1 = p1.variants[0];
+
+      // Create 2 orders
+      const makeOrder = async (key: string) => {
+        const res = await fx.app.request('http://localhost:3000/api/checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: fx.custCookie,
+            'x-forwarded-for': `10.0.8.${key}`,
+          },
+          body: JSON.stringify({
+            items: [{ productId: p1.id, variantId: v1.id, quantity: 1 }],
+            idempotencyKey: key,
+            address: {
+              fullName: 'Stage2 Shopper',
+              email: 'shopper@sellora.test',
+              phone: '08031234567',
+              state: 'Lagos',
+              lga: 'Ikeja',
+              city: 'Ikeja',
+              streetAddress: '10 Allen Ave',
+            },
+          }),
+        });
+        assert.equal(res.status, 201);
+        return res.json();
+      };
+
+      const ord1 = await makeOrder('fail_inj_ord_1');
+      const ord2 = await makeOrder('fail_inj_ord_2');
+
+      // Confirm ord1 & ord2 before evidence arrives (simulating admin winning verify race)
+      await fx.app.request(`http://localhost:3000/api/admin/payments/${ord1.orderId}/verify`, {
+        method: 'POST',
+        headers: { Cookie: fx.ownerCookie },
+      });
+
+      // Wait: to test DB batch abort *after* pre-read passes AND storage.put succeeds,
+      // wrap storage.put so when the evidence upload puts to R2, we immediately confirm ord2 concurrently before db.batch runs!
+      const origPut = fx.storage.put.bind(fx.storage);
+      let injectedVerifyOnPut = false;
+      fx.storage.put = async (key, data, contentType) => {
+        await origPut(key, data, contentType);
+        if (!injectedVerifyOnPut && key.includes(ord2.orderId)) {
+          injectedVerifyOnPut = true;
+          await fx.db.run(
+            `UPDATE payments SET status = 'payment_confirmed' WHERE order_id = ?`,
+            [ord2.orderId]
+          );
+        }
+      };
+
+      const makeReceiptForm = (idem: string) => {
+        const form = new FormData();
+        form.set('referenceNumber', `TRF-${idem}`);
+        form.set('amountNaira', String(ord2.totalKobo / 100));
+        form.set('transferDate', '2026-11-15');
+        form.set('idempotencyKey', idem);
+        form.set(
+          'receipt',
+          new File(
+            [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])],
+            'receipt.png',
+            { type: 'image/png' }
+          )
+        );
+        return form;
+      };
+
+      // Case A: DB aborts with PAYMENT_ALREADY_CONFIRMED after R2 put -> compensating storage.delete removes R2 file
+      const evFailA = await fx.app.request(
+        `http://localhost:3000/api/payments/${ord2.orderNumber}/evidence`,
+        {
+          method: 'POST',
+          headers: { Cookie: fx.custCookie },
+          body: makeReceiptForm('ev_race_delete_ok'),
+        }
+      );
+      assert.equal(evFailA.status, 400);
+      const receiptsLeftA = await fx.storage.list!('receipts/');
+      assert.equal(receiptsLeftA.length, 0);
+      const evCount = await fx.db.get<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt FROM payment_evidence WHERE order_id = ?`,
+        [ord2.orderId]
+      );
+      assert.equal(evCount?.cnt, 0);
+
+      // Case B: Inject BOTH DB failure AND storage.delete failure -> records storage_orphan_records, then admin cleanup deletes it
+      const ord3 = await makeOrder('fail_inj_ord_3');
+      const origDelete = fx.storage.delete.bind(fx.storage);
+      let failDeleteOnce = true;
+      fx.storage.put = async (key, data, contentType) => {
+        await origPut(key, data, contentType);
+        if (key.includes(ord3.orderId)) {
+          await fx.db.run(
+            `UPDATE payments SET status = 'payment_confirmed' WHERE order_id = ?`,
+            [ord3.orderId]
+          );
+        }
+      };
+      fx.storage.delete = async (key) => {
+        if (failDeleteOnce) {
+          failDeleteOnce = false;
+          throw new Error('Simulated R2 delete outage');
+        }
+        return origDelete(key);
+      };
+
+      const evFailB = await fx.app.request(
+        `http://localhost:3000/api/payments/${ord3.orderNumber}/evidence`,
+        {
+          method: 'POST',
+          headers: { Cookie: fx.custCookie },
+          body: makeReceiptForm('ev_race_delete_fails'),
+        }
+      );
+      assert.equal(evFailB.status, 400);
+
+      const pendingOrphans = await fx.db.all<{ r2_key: string; status: string }>(
+        `SELECT r2_key, status FROM storage_orphan_records WHERE status = 'pending'`
+      );
+      assert.equal(pendingOrphans.length, 1);
+
+      // Dry-run reports pending orphan without deleting it
+      const dryRunRes = await (
+        await fx.app.request('http://localhost:3000/api/admin/storage/cleanup-orphans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+          body: JSON.stringify({ dryRun: true }),
+        })
+      ).json();
+      assert.equal(dryRunRes.pendingCount, 1);
+
+      // Live cleanup deletes the file from storage and marks orphan record 'deleted'
+      const cleanRes = await (
+        await fx.app.request('http://localhost:3000/api/admin/storage/cleanup-orphans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+          body: JSON.stringify({ dryRun: false }),
+        })
+      ).json();
+      assert.equal(cleanRes.resolvedPending.length, 1);
+      assert.equal((await fx.storage.list!('receipts/')).length, 0);
+
+      // Case C: Concurrent PATCH /admin/orders/:id/status stale state -> DB-level abort (409 + 0 orphan history rows)
+      const st1 = await fx.app.request(`http://localhost:3000/api/admin/orders/${ord1.orderId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({ orderStatus: 'processing', deliveryStatus: 'preparing' }),
+      });
+      assert.equal(st1.status, 200);
+
+      // Simulate another isolate/admin cancelling the order *after* this handler's pre-read and *before* its db.batch() executes
+      const origBatch = fx.db.batch.bind(fx.db);
+      let injectedConflict = false;
+      fx.db.batch = async (stmts) => {
+        if (
+          !injectedConflict &&
+          stmts.some((s) => s.sql.includes('UPDATE orders SET') && s.sql.includes('WHERE order_id = ? AND order_status = ?'))
+        ) {
+          injectedConflict = true;
+          await fx.db.run(
+            `UPDATE orders SET order_status = 'cancelled', delivery_status = 'cancelled', updated_at = ? WHERE order_id = ?`,
+            [new Date(Date.now() + 5000).toISOString(), ord1.orderId]
+          );
+        }
+        return origBatch(stmts);
+      };
+
+      const staleRes = await fx.app.request(`http://localhost:3000/api/admin/orders/${ord1.orderId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({ orderStatus: 'ready_for_dispatch', deliveryStatus: 'ready_for_dispatch' }),
+      });
+      assert.equal(staleRes.status, 409);
+
+      const finalOrd = await fx.db.get<{ order_status: string; delivery_status: string }>(
+        `SELECT order_status, delivery_status FROM orders WHERE order_id = ?`,
+        [ord1.orderId]
+      );
+      const orphanHist = await fx.db.get<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt FROM order_status_history WHERE order_id = ? AND new_status = 'ready_for_dispatch'`,
+        [ord1.orderId]
+      );
+      assert.equal(finalOrd?.order_status, 'cancelled');
+      assert.equal(finalOrd?.delivery_status, 'cancelled');
+      assert.equal(orphanHist?.cnt, 0);
+    } finally {
+      fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('Automatic SKU generation assigns unique SKUs on create/duplicate, handles concurrency, and preserves existing SKU on edit', async () => {
+  const fx = await setupCommerceFixture();
+  try {
+    // 1. Create product without supplying SKU -> backend assigns uppercase SLR-XXX-XXXXXX + -V1
+    const createRes = await fx.app.request('http://localhost:3000/api/admin/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+      body: JSON.stringify({
+        name: 'Kano Brass Desk Organizer',
+        priceNaira: 48000,
+        stockQuantity: 15,
+        status: 'active',
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const created = (await createRes.json()) as { id: string; sku: string; variantSku: string };
+    assert.match(created.sku, /^SLR-[A-Z0-9]{3}-[A-F0-9]{6}$/);
+    assert.equal(created.variantSku, `${created.sku}-V1`);
+
+    const dbProd = await fx.db.get<{ sku: string }>(`SELECT sku FROM products WHERE id = ?`, [created.id]);
+    const dbVar = await fx.db.get<{ sku: string }>(`SELECT sku FROM product_variants WHERE product_id = ?`, [
+      created.id,
+    ]);
+    assert.equal(dbProd?.sku, created.sku);
+    assert.equal(dbVar?.sku, created.variantSku);
+
+    // 2. Concurrent creation of 8 identically named products -> all SKUs unique with zero collisions
+    type CreatedSku = { id: string; sku: string; variantSku: string };
+    const concurrentReqs: Array<Promise<CreatedSku>> = Array.from({ length: 8 }, async (_, idx) => {
+      const r = await fx.app.request('http://localhost:3000/api/admin/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+        body: JSON.stringify({
+          name: 'Identical Ceramic Vase',
+          sku: 'ATTEMPTED-MANUAL-OVERRIDE', // ignored by backend
+          priceNaira: 25000 + idx * 100,
+          stockQuantity: 5,
+        }),
+      });
+      return (await r.json()) as CreatedSku;
+    });
+    const concurrentResults = await Promise.all(concurrentReqs);
+    const skuSet = new Set(concurrentResults.map((r: CreatedSku) => r.sku));
+    const varSkuSet = new Set(concurrentResults.map((r: CreatedSku) => r.variantSku));
+    assert.equal(skuSet.size, 8);
+    assert.equal(varSkuSet.size, 8);
+    assert.ok(!skuSet.has('ATTEMPTED-MANUAL-OVERRIDE'));
+
+    // 3. Edit product (even with sku field in payload) -> preserves original SKU and never regenerates it
+    const editRes = await fx.app.request(`http://localhost:3000/api/admin/products/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+      body: JSON.stringify({
+        name: 'Kano Brass Desk Organizer Pro',
+        sku: 'SHOULD-BE-IGNORED-999',
+        priceNaira: 52000,
+      }),
+    });
+    assert.equal(editRes.status, 200);
+    const afterEditProd = await fx.db.get<{ name: string; sku: string }>(
+      `SELECT name, sku FROM products WHERE id = ?`,
+      [created.id]
+    );
+    const afterEditVar = await fx.db.get<{ sku: string; price_kobo: number }>(
+      `SELECT sku, price_kobo FROM product_variants WHERE product_id = ?`,
+      [created.id]
+    );
+    assert.equal(afterEditProd?.name, 'Kano Brass Desk Organizer Pro');
+    assert.equal(afterEditProd?.sku, created.sku);
+    assert.equal(afterEditVar?.sku, created.variantSku);
+    assert.equal(afterEditVar?.price_kobo, 5200000);
+
+    // 4. Duplicate product -> atomically creates new product + variant with distinct auto-generated SKU
+    const dupRes = await fx.app.request(`http://localhost:3000/api/admin/products/${created.id}/duplicate`, {
+      method: 'POST',
+      headers: { Cookie: fx.ownerCookie },
+    });
+    assert.equal(dupRes.status, 201);
+    const dup = (await dupRes.json()) as { id: string; sku: string; variantSku: string };
+    assert.notEqual(dup.sku, created.sku);
+    assert.match(dup.sku, /^SLR-[A-Z0-9]{3}-[A-F0-9]{6}$/);
+    assert.equal(dup.variantSku, `${dup.sku}-V1`);
+
+    // 5. Public storefront /api/products and /api/storefront/config reflect updated name & categories
+    const shopRes = await (await fx.app.request('http://localhost:3000/api/products?q=Kano%20Brass')).json();
+    assert.ok(shopRes.products.some((p: any) => p.id === created.id && p.name === 'Kano Brass Desk Organizer Pro'));
+    const cfgRes = await (await fx.app.request('http://localhost:3000/api/storefront/config')).json();
+    assert.ok(Array.isArray(cfgRes.categories) && cfgRes.categories.length >= 1);
+  } finally {
+    fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Public API responses, notification errors, and role permissions enforce strict privacy and isolation', async () => {
+  const fx = await setupCommerceFixture();
+  try {
+    // 1. /api/health & /api/me do not leak infrastructure, provider names, or secret state
+    const healthText = await (await fx.app.request('http://localhost:3000/api/health')).text();
+    assert.equal(healthText.includes('cloudflare'), false);
+    assert.equal(healthText.includes('d1'), false);
+    assert.equal(healthText.includes('sqlite'), false);
+
+    const me = await (await fx.app.request('http://localhost:3000/api/me')).json();
+    assert.equal(me.capabilities.brevoConfigured, undefined);
+    assert.equal(me.capabilities.aiConfigured, undefined);
+
+    // 2. Notification failure sanitization avoids leaking env var or provider names when unconfigured
+    const queued = await queueEmailEvent(fx.db, {
+      idempotencyKey: `sanitized:err:${Date.now()}`,
+      recipientEmail: 'shopper@example.com',
+      recipientType: 'customer',
+      notificationType: 'order_placed',
+      subject: 'Order Alert',
+      htmlBody: '<p>Test</p>',
+    });
+    const resNoCreds = await dispatchSingleEmailEvent(
+      fx.db,
+      { brevoApiKey: undefined, brevoFromEmail: undefined, adminNotificationEmail: 'olarindevictor046@gmail.com' },
+      queued.eventId!
+    );
+    assert.equal(resNoCreds.ok, false);
+    assert.equal(resNoCreds.error?.includes('BREVO_API_KEY'), false);
+    assert.equal(resNoCreds.error?.includes('BREVO_FROM_EMAIL'), false);
+    assert.equal(resNoCreds.error, 'Notification service credentials are not configured.');
+
+    // 3. Non-owner administrator is blocked from audit logs, staff, sessions, email settings/history
+    await fx.app.request('http://localhost:3000/api/admin/staff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
+      body: JSON.stringify({
+        name: 'Store Manager',
+        email: 'manager@sellora.test',
+        password: 'ManagerPassword123!',
+        role: 'admin',
+      }),
+    });
+    const staffLogin = await fx.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'manager@sellora.test', password: 'ManagerPassword123!' }),
+    });
+    const staffCookie = staffLogin.headers.get('set-cookie')!.split(';')[0];
+
+    for (const restrictedPath of ['/api/admin/staff', '/api/admin/sessions', '/api/admin/audit-logs']) {
+      const r = await fx.app.request(`http://localhost:3000${restrictedPath}`, {
+        headers: { Cookie: staffCookie },
+      });
+      assert.equal(r.status, 403, `Expected 403 for ${restrictedPath}`);
+    }
+
+    const emailWriteAttempt = await fx.app.request('http://localhost:3000/api/admin/settings/email', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Cookie: staffCookie },
+      body: JSON.stringify({ fromEmail: 'hijack@example.com' }),
+    });
+    assert.equal(emailWriteAttempt.status, 403);
+  } finally {
+    fs.rmSync(fx.tmpDir, { recursive: true, force: true });
+  }
+});
+
+describe('Three-Layer Security Standard (Layers 1, 2 & 3)', () => {
+  test('Layer 2: fail-closed Brevo webhook, CSRF origin blocking, security headers, upload magic bytes & sandboxed downloads', async () => {
+    const validPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+
+    // 1. Fail-closed Brevo webhook when BREVO_WEBHOOK_SECRET is unset -> 503
+    const rtNoSecret = createTestRuntime();
+    try {
+      const res503 = await rtNoSecret.app.request('http://localhost:3000/api/webhooks/brevo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'delivered', 'message-id': 'msg-1' }),
+      });
+      assert.equal(res503.status, 503);
+    } finally {
+      fs.rmSync(rtNoSecret.tmpDir, { recursive: true, force: true });
+    }
+
+    // 2. Brevo webhook secret verification, CSRF, headers, upload validation & receipt download CSP
+    const rt = createTestRuntime({ brevoWebhookSecret: 'brevo-super-secret-token' });
+    try {
+      await seedInitialStoreData(rt.db);
+      const { cookie: ownerCookie } = await provisionAndSignInOwner(rt);
+
+      const badWebhook = await rt.app.request('http://localhost:3000/api/webhooks/brevo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-brevo-secret': 'wrong-secret' },
+        body: JSON.stringify({ event: 'delivered', 'message-id': 'msg-1' }),
+      });
+      assert.equal(badWebhook.status, 401);
+
+      const okWebhook = await rt.app.request('http://localhost:3000/api/webhooks/brevo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-brevo-secret': 'brevo-super-secret-token' },
+        body: JSON.stringify({ event: 'delivered', 'message-id': 'msg-1' }),
+      });
+      assert.equal(okWebhook.status, 200);
+
+      // CSRF blocks cross-site origin and Sec-Fetch-Site: cross-site on mutating store endpoints
+      const csrfOriginRes = await rt.app.request('http://localhost:3000/api/cart/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://evil.attacker.test' },
+        body: JSON.stringify({ productId: 'p1', variantId: 'v1', quantity: 1 }),
+      });
+      assert.equal(csrfOriginRes.status, 403);
+
+      const csrfFetchMetaRes = await rt.app.request('http://localhost:3000/api/cart/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'cross-site' },
+        body: JSON.stringify({ productId: 'p1', variantId: 'v1', quantity: 1 }),
+      });
+      assert.equal(csrfFetchMetaRes.status, 403);
+
+      // Security headers + HSTS on HTTPS URLs
+      const httpsRes = await rt.app.request('https://sellora.example.com/api/health');
+      assert.equal(httpsRes.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(httpsRes.headers.get('x-frame-options'), 'DENY');
+      assert.ok(httpsRes.headers.get('strict-transport-security')?.includes('max-age=31536000'));
+      assert.ok(httpsRes.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"));
+
+      // Polyglot <svg>/<script> disguised as PNG rejected on admin media upload
+      const polyglotBytes = new TextEncoder().encode('<svg onload="alert(1)"><script>fetch(1)</script></svg>');
+      assert.equal(validateUploadedFileBytes(polyglotBytes, 'image/png', ['image/png']).ok, false);
+
+      const badMediaForm = new FormData();
+      badMediaForm.append('file', new File([polyglotBytes], 'evil.png', { type: 'image/png' }));
+      const badMediaRes = await rt.app.request('http://localhost:3000/api/admin/media/upload', {
+        method: 'POST',
+        headers: { Cookie: ownerCookie },
+        body: badMediaForm,
+      });
+      assert.equal(badMediaRes.status, 400);
+
+      const goodMediaForm = new FormData();
+      goodMediaForm.append('file', new File([validPng], 'valid.png', { type: 'image/png' }));
+      const goodMediaRes = await rt.app.request('http://localhost:3000/api/admin/media/upload', {
+        method: 'POST',
+        headers: { Cookie: ownerCookie },
+        body: goodMediaForm,
+      });
+      assert.equal(goodMediaRes.status, 201);
+
+      // Receipt upload rejects spoofed magic bytes; valid receipt downloads with attachment & sandbox CSP
+      await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Sec Shopper', email: 'sec@shopper.ng', password: 'Password123!' }),
+      });
+      const signIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sec@shopper.ng', password: 'Password123!' }),
+      });
+      const custCookie = signIn.headers.get('set-cookie')!.split(';')[0];
+
+      const addZoneRes = await rt.app.request('http://localhost:3000/api/admin/delivery-zones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          state: 'Lagos',
+          lga: 'Ikeja',
+          feeNaira: 3500,
+          estimatedDaysMin: 1,
+          estimatedDaysMax: 2,
+        }),
+      });
+      assert.equal(addZoneRes.status, 201);
+
+      const prodRes = await (await rt.app.request('http://localhost:3000/api/products')).json();
+      const firstProd = prodRes.products[0];
+      const checkoutRes = await rt.app.request('http://localhost:3000/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: custCookie },
+        body: JSON.stringify({
+          items: [{ productId: firstProd.id, variantId: firstProd.variants[0].id, quantity: 1 }],
+          idempotencyKey: 'sec-receipt-ord-1',
+          address: {
+            fullName: 'Sec Shopper',
+            email: 'sec@shopper.ng',
+            phone: '08031234567',
+            state: 'Lagos',
+            lga: 'Ikeja',
+            city: 'Ikeja',
+            streetAddress: '10 Bode Thomas',
+          },
+        }),
+      });
+      assert.equal(checkoutRes.status, 201);
+      const ord = await checkoutRes.json();
+
+      const spoofForm = new FormData();
+      spoofForm.append('referenceNumber', 'REF-BAD-1');
+      spoofForm.append('amountNaira', String(ord.totalKobo / 100));
+      spoofForm.append('transferDate', '2026-11-16');
+      spoofForm.append('receipt', new File([polyglotBytes], 'fake.png', { type: 'image/png' }));
+      const spoofUpload = await rt.app.request(`http://localhost:3000/api/payments/${ord.orderNumber}/evidence`, {
+        method: 'POST',
+        headers: { Cookie: custCookie },
+        body: spoofForm,
+      });
+      assert.equal(spoofUpload.status, 400);
+
+      const goodForm = new FormData();
+      goodForm.append('referenceNumber', 'REF-GOOD-1');
+      goodForm.append('amountNaira', String(ord.totalKobo / 100));
+      goodForm.append('transferDate', '2026-11-16');
+      goodForm.append('receipt', new File([validPng], '../../evil<script>.png', { type: 'image/png' }));
+      const goodUpload = await rt.app.request(`http://localhost:3000/api/payments/${ord.orderNumber}/evidence`, {
+        method: 'POST',
+        headers: { Cookie: custCookie },
+        body: goodForm,
+      });
+      assert.equal(goodUpload.status, 201);
+      const goodEv = await goodUpload.json();
+
+      const downloadRes = await rt.app.request(
+        `http://localhost:3000/api/payments/evidence/${goodEv.evidenceId}/file`,
+        { headers: { Cookie: custCookie } }
+      );
+      assert.equal(downloadRes.status, 200);
+      assert.ok(downloadRes.headers.get('content-disposition')?.includes('attachment'));
+      assert.ok(downloadRes.headers.get('content-security-policy')?.includes('sandbox'));
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Layer 2: trusted client IP (Worker vs spoofed XFF), persistent rate limiting, Turnstile replay block & login brute-force lockout', async () => {
+    const spoofedHeaders = new Headers({
+      'x-forwarded-for': '203.0.113.99',
+      'cf-connecting-ip': '198.51.100.42',
+    });
+    assert.equal(getTrustedClientIp(spoofedHeaders, { runtime: 'worker' }), '198.51.100.42');
+    const workerNoCf = new Headers({ 'x-forwarded-for': '203.0.113.99' });
+    assert.equal(getTrustedClientIp(workerNoCf, { runtime: 'worker' }), 'worker-client');
+    assert.equal(getTrustedClientIp(workerNoCf, { runtime: 'node', trustedProxy: true }), '203.0.113.99');
+
+    const rt = createTestRuntime({
+      turnstileSecretKey: '1x0000000000000000000000000000000AA',
+      turnstileSiteKey: '1x00000000000000000000AA',
+    });
+    const origFetch = globalThis.fetch;
+    try {
+      // Persistent DB-backed rate limiter
+      const k = `test-bucket-${Date.now()}`;
+      assert.equal((await checkPersistentRateLimit(rt.db, k, 2, 60_000)).allowed, true);
+      assert.equal((await checkPersistentRateLimit(rt.db, k, 2, 60_000)).allowed, true);
+      const third = await checkPersistentRateLimit(rt.db, k, 2, 60_000);
+      assert.equal(third.allowed, false);
+      assert.ok(third.retryAfterSec >= 1);
+
+      // Turnstile persistent single-use replay protection
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof fetch;
+
+      const t1 = await verifyTurnstileToken({
+        token: 'turnstile-unique-token-abc123456',
+        secretKey: rt.env.turnstileSecretKey,
+        siteKey: rt.env.turnstileSiteKey,
+        remoteIp: '198.51.100.1',
+        db: rt.db,
+      });
+      assert.equal(t1.ok, true);
+      assert.equal(t1.status, 'verified');
+
+      const tReplay = await verifyTurnstileToken({
+        token: 'turnstile-unique-token-abc123456',
+        secretKey: rt.env.turnstileSecretKey,
+        siteKey: rt.env.turnstileSiteKey,
+        remoteIp: '198.51.100.1',
+        db: rt.db,
+      });
+      assert.equal(tReplay.ok, false);
+      assert.equal(tReplay.status, 'failed');
+
+      // Progressive brute-force login throttle locks on 2nd bad password for 10m (600s) & clears on recovery
+      const rtAuth = createTestRuntime();
+      try {
+        await provisionOwnerInDb(rtAuth.db, {
+          name: 'Victor Olarinde',
+          email: 'olarindevictor046@gmail.com',
+          password: 'CorrectPassword123!',
+        });
+
+        const fail1 = await rtAuth.app.request('http://localhost:3000/api/auth/sign-in/email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.77' },
+          body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword!' }),
+        });
+        assert.equal(fail1.status, 401);
+
+        const fail2 = await rtAuth.app.request('http://localhost:3000/api/auth/sign-in/email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.77' },
+          body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword!' }),
+        });
+        assert.equal(fail2.status, 429);
+        assert.ok(Number(fail2.headers.get('retry-after')) >= 595);
+
+        const lockedRes = await rtAuth.app.request('http://localhost:3000/api/auth/sign-in/email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.77' },
+          body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'CorrectPassword123!' }),
+        });
+        assert.equal(lockedRes.status, 429);
+        assert.ok(Number(lockedRes.headers.get('retry-after')) >= 595);
+
+        const secEv = await rtAuth.db.get<{ event_ref: string }>(
+          `SELECT event_ref FROM security_events WHERE event_category = 'account_lockout_triggered'`
+        );
+        assert.match(secEv?.event_ref || '', /^SEC-[A-Z2-9]{8}$/);
+      } finally {
+        fs.rmSync(rtAuth.tmpDir, { recursive: true, force: true });
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Layer 3: private error monitoring redaction, 5-min deduplication, DB fallback & sanitized ERR reference responses', async () => {
+    const rt = createTestRuntime();
+    try {
+      // Secret redaction & 5-minute deduplication
+      const sensitiveErr = new Error(
+        'Brevo failed with Authorization: Bearer secret_abc123 xkeysib-abcdef123456 on sqlite:///var/data/prod.db'
+      );
+      const first = await recordCapturedError(rt.db, {
+        serviceCategory: 'email',
+        failedOperation: 'dispatchEmail',
+        location: 'src/server/email.ts',
+        environment: 'test',
+        error: sensitiveErr,
+        extraSafeContext: { apiKey: 'must_redact_secret', orderNumber: 'SLR-1001' },
+      });
+      assert.match(first.refId, /^ERR-[A-Z2-9]{8}$/);
+      assert.equal(first.deduplicated, false);
+      assert.equal(first.persistedToDb, true);
+
+      const second = await recordCapturedError(rt.db, {
+        serviceCategory: 'email',
+        failedOperation: 'dispatchEmail',
+        location: 'src/server/email.ts',
+        environment: 'test',
+        error: sensitiveErr,
+        extraSafeContext: { apiKey: 'must_redact_secret', orderNumber: 'SLR-1001' },
+      });
+      assert.equal(second.deduplicated, true);
+      assert.equal(second.refId, first.refId);
+
+      const stored = await rt.db.get<{ sanitized_message: string; occurrence_count: number }>(
+        `SELECT sanitized_message, occurrence_count FROM error_monitoring_logs WHERE ref_id = ?`,
+        [first.refId]
+      );
+      assert.equal(stored?.occurrence_count, 2);
+      assert.equal(stored?.sanitized_message.includes('secret_abc123'), false);
+      assert.equal(stored?.sanitized_message.includes('xkeysib-abcdef123456'), false);
+      assert.equal(stored?.sanitized_message.includes('must_redact_secret'), false);
+      assert.equal(stored?.sanitized_message.includes('/var/data/prod.db'), false);
+      assert.ok(stored?.sanitized_message.includes('[REDACTED'));
+
+      // Fallback logger works without throwing when DB errors occur
+      const fallbackLogs: Record<string, unknown>[] = [];
+      const brokenDb = {
+        ...rt.db,
+        async get() {
+          throw new Error('D1 unreachable');
+        },
+        async run() {
+          throw new Error('D1 unreachable');
+        },
+      };
+      const fb = await recordCapturedError(
+        brokenDb as any,
+        {
+          serviceCategory: 'database',
+          failedOperation: 'fallbackCheck',
+          location: 'test',
+          error: new Error('sqlite failure'),
+        },
+        (entry) => fallbackLogs.push(entry)
+      );
+      assert.equal(fb.persistedToDb, false);
+      assert.match(fb.refId, /^ERR-[A-Z2-9]{8}$/);
+      assert.equal(fallbackLogs.length, 1);
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Layer 3: new-device sign-in alert, single-use confirm/dispute tokens revoking all sessions, and /api/me/sessions', async () => {
+    const rt = createTestRuntime();
+    try {
+      await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Device User', email: 'device@sellora.test', password: 'StrongPassword123!' }),
+      });
+
+      // Sign-in #1 from Chrome on Windows
+      const login1 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36',
+          'cf-ipcountry': 'NG',
+        },
+        body: JSON.stringify({ email: 'device@sellora.test', password: 'StrongPassword123!' }),
+      });
+      assert.equal(login1.status, 200);
+      const cookie1 = login1.headers.get('set-cookie')!.split(';')[0];
+
+      // Sign-in #2 from Safari on iPhone -> triggers new-device detection & single-use confirm/dispute tokens
+      const login2 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1',
+          'cf-ipcountry': 'NG',
+        },
+        body: JSON.stringify({ email: 'device@sellora.test', password: 'StrongPassword123!' }),
+      });
+      assert.equal(login2.status, 200);
+      const cookie2 = login2.headers.get('set-cookie')!.split(';')[0];
+
+      // Check /api/me/sessions shows both active sessions
+      const sessionsRes = await rt.app.request('http://localhost:3000/api/me/sessions', {
+        headers: { Cookie: cookie2 },
+      });
+      assert.equal(sessionsRes.status, 200);
+      const sessBody = await sessionsRes.json();
+      assert.equal(sessBody.sessions.length, 3);
+      assert.ok(sessBody.recentLogins.some((l: any) => l.is_new_device === 1));
+
+      // Retrieve the alert email's dispute URL & confirm URL via recordLoginAttemptAndMonitor directly for token test
+      const userRow = await rt.db.get<{ id: string }>(`SELECT id FROM user WHERE email = 'device@sellora.test'`);
+      const mon3 = await recordLoginAttemptAndMonitor(rt.db, rt.env, {
+        headers: new Headers({
+          'user-agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+          'cf-ipcountry': 'GB',
+        }),
+        userId: userRow!.id,
+        email: 'device@sellora.test',
+        userName: 'Device User',
+        userRole: 'customer',
+        authMethod: 'email_password',
+        outcome: 'success',
+      });
+      assert.equal(mon3.isNewDevice, true);
+      assert.equal(mon3.isUnusual, true);
+      assert.match(mon3.eventRef || '', /^SEC-[A-Z2-9]{8}$/);
+      assert.ok(mon3.disputeUrl && mon3.confirmUrl);
+
+      const disputeToken = new URL(mon3.disputeUrl!).searchParams.get('token')!;
+      const confirmToken = new URL(mon3.confirmUrl!).searchParams.get('token')!;
+
+      // Clicking "This wasn't me" revokes ALL sessions and invalidates paired confirm token too
+      const disputeRes = await rt.app.request(
+        `http://localhost:3000/api/security/login-response?action=dispute&token=${encodeURIComponent(disputeToken)}`
+      );
+      assert.equal(disputeRes.status, 200);
+
+      // Both active session cookies must now be rejected
+      const after1 = await rt.app.request('http://localhost:3000/api/me/sessions', {
+        headers: { Cookie: cookie1 },
+      });
+      const after2 = await rt.app.request('http://localhost:3000/api/me/sessions', {
+        headers: { Cookie: cookie2 },
+      });
+      assert.equal(after1.status, 401);
+      assert.equal(after2.status, 401);
+
+      // Paired confirm token cannot be replayed after dispute consumed it
+      const replayConfirm = await rt.app.request(
+        `http://localhost:3000/api/security/login-response?action=confirm&token=${encodeURIComponent(confirmToken)}`
+      );
+      assert.equal(replayConfirm.status, 400);
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Layer 3: isolated Developer Portal API enforces Bearer keys, scopes, revocation, zero commerce access & immutable audit_logs', async () => {
+    const rt = createTestRuntime();
+    try {
+      await seedInitialStoreData(rt.db);
+      const { cookie: ownerCookie } = await provisionAndSignInOwner(rt);
+
+      // Create an error log record & a security event so portal has rows to query
+      const cap = await recordCapturedError(rt.db, {
+        serviceCategory: 'payment',
+        failedOperation: 'verifyCheck',
+        location: 'src/server/routes/orders.ts',
+        environment: 'production',
+        error: new Error('Payment reference validation glitch'),
+      });
+
+      // Owner issues a scoped developer integration key
+      const createKeyRes = await rt.app.request('http://localhost:3000/api/admin/developer-integrations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          portalName: 'PixelBridge Support',
+          scopes: ['errors:read', 'errors:update', 'security:read'],
+          expiresInDays: 90,
+        }),
+      });
+      assert.equal(createKeyRes.status, 201);
+      const keyData = await createKeyRes.json();
+      assert.ok(keyData.apiKey.startsWith('slr_dev_'));
+
+      // Store session cookie alone is strictly REJECTED by /api/developer/*
+      const cookieAttempt = await rt.app.request('http://localhost:3000/api/developer/errors', {
+        headers: { Cookie: ownerCookie },
+      });
+      assert.equal(cookieAttempt.status, 401);
+
+      // Developer Bearer key CANNOT access commerce/admin/orders routes
+      const adminAttemptWithDevKey = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Authorization: `Bearer ${keyData.apiKey}` },
+      });
+      assert.equal(adminAttemptWithDevKey.status, 401);
+
+      // Scoped read/update succeeds on /api/developer/*
+      const errListRes = await rt.app.request('http://localhost:3000/api/developer/errors', {
+        headers: { Authorization: `Bearer ${keyData.apiKey}` },
+      });
+      assert.equal(errListRes.status, 200);
+      const errList = await errListRes.json();
+      assert.ok(errList.errors.some((e: any) => e.ref_id === cap.refId));
+
+      const patchErrRes = await rt.app.request(
+        `http://localhost:3000/api/developer/errors/${cap.refId}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${keyData.apiKey}`,
+          },
+          body: JSON.stringify({ investigationStatus: 'resolved', resolutionNotes: 'Mitigated' }),
+        }
+      );
+      assert.equal(patchErrRes.status, 200);
+
+      // Un-granted scope ('audit:read') returns 403
+      const missingScopeRes = await rt.app.request('http://localhost:3000/api/developer/audit-logs', {
+        headers: { Authorization: `Bearer ${keyData.apiKey}` },
+      });
+      assert.equal(missingScopeRes.status, 403);
+
+      // Owner revokes key -> immediately rejected (403)
+      const revokeRes = await rt.app.request(
+        `http://localhost:3000/api/admin/developer-integrations/${keyData.id}`,
+        { method: 'DELETE', headers: { Cookie: ownerCookie } }
+      );
+      assert.equal(revokeRes.status, 200);
+
+      const postRevokeRes = await rt.app.request('http://localhost:3000/api/developer/errors', {
+        headers: { Authorization: `Bearer ${keyData.apiKey}` },
+      });
+      assert.equal(postRevokeRes.status, 403);
+
+      // audit_logs immutability trigger prevents DELETE even at SQL level
+      await assert.rejects(
+        () => rt.db.run(`DELETE FROM audit_logs`),
+        (err: Error) => err.message.includes('AUDIT_LOGS_IMMUTABLE')
+      );
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('Login-Attempt Security Policy: 2-attempt 10m lockout, +5m progressive cycles (15m, 20m), configurable cap, concurrency mutex, password-reset recovery & OAuth isolation', async () => {
+  const rt = createTestRuntime({
+    loginMaxLockoutSeconds: 1200, // Test 20-minute cap (1200s) -> 10m -> 15m -> 20m -> 20m
+  });
+  try {
+    await seedInitialStoreData(rt.db);
+    await provisionOwnerInDb(rt.db, {
+      name: 'Victor Olarinde',
+      email: 'olarindevictor046@gmail.com',
+      password: 'CorrectOwnerPassword123!',
+    });
+
+    const ip = '198.51.100.88';
+
+    // 1. Generic non-enumerating 401 on 1st failed attempt (both existing and non-existent emails)
+    const unknownFail = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'nobody@example.com', password: 'WrongPassword123!' }),
+    });
+    const knownFail1 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword123!' }),
+    });
+    assert.equal(unknownFail.status, 401);
+    assert.equal(knownFail1.status, 401);
+    const unknownBody = await unknownFail.json();
+    const knownBody1 = await knownFail1.json();
+    assert.equal(unknownBody.error, 'Invalid email or password.');
+    assert.equal(knownBody1.error, unknownBody.error); // Zero enumeration difference
+
+    // After 1st failure, account is NOT locked
+    const throttleAfter1 = await rt.db.get<{ fail_count: number; lockout_cycles: number; locked_until_ms: number }>(
+      `SELECT fail_count, lockout_cycles, locked_until_ms FROM auth_login_throttles WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`
+    );
+    assert.equal(throttleAfter1?.fail_count, 1);
+    assert.equal(throttleAfter1?.lockout_cycles, 0);
+    assert.equal(throttleAfter1?.locked_until_ms, 0);
+
+    // 2. 2nd consecutive failure triggers immediate 10-minute (600s) lockout + deduplicated alert email
+    const knownFail2 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword123!' }),
+    });
+    assert.equal(knownFail2.status, 429);
+    const retryAfter2 = Number(knownFail2.headers.get('retry-after'));
+    assert.ok(retryAfter2 >= 595 && retryAfter2 <= 600);
+    const body2 = await knownFail2.json();
+    assert.equal(
+      body2.error,
+      'Sign-in is temporarily restricted due to repeated attempts. Please wait before trying again or reset your password.'
+    );
+
+    const throttleAfter2 = await rt.db.get<{ fail_count: number; lockout_cycles: number; locked_until_ms: number }>(
+      `SELECT fail_count, lockout_cycles, locked_until_ms FROM auth_login_throttles WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`
+    );
+    assert.equal(throttleAfter2?.fail_count, 2);
+    assert.equal(throttleAfter2?.lockout_cycles, 1);
+    assert.ok((throttleAfter2?.locked_until_ms || 0) > Date.now() + 590_000);
+
+    // 3. During active lockout: even the CORRECT password is blocked AND locked_until_ms does NOT extend
+    const blockedCorrect = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '203.0.113.55' }, // different IP still locked!
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'CorrectOwnerPassword123!' }),
+    });
+    assert.equal(blockedCorrect.status, 429);
+    // recordFailedLoginAttempt while already locked leaves fail_count & lockout_cycles untouched
+    const whileLocked = await recordFailedLoginAttempt(rt.db, 'olarindevictor046@gmail.com', ip, {
+      maxLockoutSec: 1200,
+    });
+    assert.equal(whileLocked.newlyLocked, false);
+    assert.equal(whileLocked.lockoutCycles, 1);
+
+    // Only ONE deduplicated lockout alert email was queued for lockout cycle 1
+    const lockAlerts = await rt.db.all<{ idempotency_key: string }>(
+      `SELECT idempotency_key FROM email_notification_events WHERE notification_type = 'security_login_lockout'`
+    );
+    assert.equal(lockAlerts.length, 1);
+
+    // 4. Simulate 1st lockout expiry (keep counters!) -> 3rd bad password triggers 15-minute (900s) lockout
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const checkAfterExpiry = await checkLoginThrottle(rt.db, 'olarindevictor046@gmail.com', ip);
+    assert.equal(checkAfterExpiry.allowed, true);
+    const preservedCounters = await rt.db.get<{ fail_count: number; lockout_cycles: number }>(
+      `SELECT fail_count, lockout_cycles FROM auth_login_throttles WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`
+    );
+    assert.equal(preservedCounters?.fail_count, 2);
+    assert.equal(preservedCounters?.lockout_cycles, 1);
+
+    const knownFail3 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword123!' }),
+    });
+    assert.equal(knownFail3.status, 429);
+    const retryAfter3 = Number(knownFail3.headers.get('retry-after'));
+    assert.ok(retryAfter3 >= 895 && retryAfter3 <= 900);
+
+    // 5. Simulate 2nd lockout expiry -> 4th bad password triggers 20-minute (1200s) lockout
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const knownFail4 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword123!' }),
+    });
+    assert.equal(knownFail4.status, 429);
+    const retryAfter4 = Number(knownFail4.headers.get('retry-after'));
+    assert.ok(retryAfter4 >= 1195 && retryAfter4 <= 1200);
+
+    // 6. Configurable cap (1200s) caps 5th bad attempt after expiry instead of growing to 1500s
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const knownFail5 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongPassword123!' }),
+    });
+    assert.equal(knownFail5.status, 429);
+    const retryAfter5 = Number(knownFail5.headers.get('retry-after'));
+    assert.ok(retryAfter5 >= 1195 && retryAfter5 <= 1200);
+
+    // 7. Verified password reset clears lockout and counters completely, even while locked!
+    const reqReset = await rt.app.request('http://localhost:3000/api/auth/request-password-reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        redirectTo: 'http://localhost:3000/',
+      }),
+    });
+    assert.equal(reqReset.status, 200);
+    const resetEmailRow = await rt.db.get<{ html_body: string }>(
+      `SELECT html_body FROM email_notification_events WHERE notification_type = 'auth_password_reset' ORDER BY created_at DESC LIMIT 1`
+    );
+    const resetUrlMatch = resetEmailRow?.html_body.match(/href="([^"]*reset-password[^"]*)"/);
+    assert.ok(resetUrlMatch?.[1]);
+    const resetUrl = new URL(resetUrlMatch[1].replace(/&amp;/g, '&'));
+    const resetToken =
+      resetUrl.searchParams.get('token') || resetUrl.pathname.split('/').filter(Boolean).pop()!;
+    const resetExec = await rt.app.request('http://localhost:3000/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: 'RecoveredOwnerPassword123!', token: resetToken }),
+    });
+    assert.equal(resetExec.status, 200);
+
+    // After password reset, lockout row is cleared and new password signs in immediately
+    const postResetSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'RecoveredOwnerPassword123!',
+      }),
+    });
+    assert.equal(postResetSignIn.status, 200);
+
+    // 8. Concurrent burst of 5 parallel wrong attempts cannot bypass 2-attempt lockout
+    const concurrentRes = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.90' },
+          body: JSON.stringify({
+            email: 'olarindevictor046@gmail.com',
+            password: 'BurstWrongPassword!',
+          }),
+        })
+      )
+    );
+    const statuses = concurrentRes.map((r) => r.status);
+    assert.equal(statuses.filter((s) => s === 401).length, 1);
+    assert.equal(statuses.filter((s) => s === 429).length, 4);
+
+    // After burst, expire once and verify a valid login resets counters cleanly to 0
+    await clearLoginThrottle(rt.db, 'olarindevictor046@gmail.com', '198.51.100.90');
+    await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.90' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'WrongOnceMore!',
+      }),
+    });
+    const validResetLogin = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.90' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'RecoveredOwnerPassword123!',
+      }),
+    });
+    assert.equal(validResetLogin.status, 200);
+    const rowAfterValid = await rt.db.get<{ fail_count: number }>(
+      `SELECT fail_count FROM auth_login_throttles WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`
+    );
+    assert.equal(rowAfterValid, null);
+
+    // 9. IP-based throttling across distinct emails blocks at 20 attempts in 15 minutes
+    const baseMs = 1_800_000_000_000;
+    for (let i = 1; i <= 19; i++) {
+      const r = await recordFailedLoginAttempt(rt.db, `spray${i}@example.com`, '203.0.113.199', {
+        nowMs: baseMs + i * 1000,
+      });
+      assert.equal(r.locked, false);
+    }
+    const r20 = await recordFailedLoginAttempt(rt.db, 'spray20@example.com', '203.0.113.199', {
+      nowMs: baseMs + 20_000,
+    });
+    assert.equal(r20.locked, true);
+    assert.equal(r20.retryAfterSec, 300);
+
+    // 10. Google OAuth sign-in is NOT blocked by password lockout
+    const rtOauth = createTestRuntime({
+      googleClientId: 'mock-client-id',
+      googleClientSecret: 'mock-client-secret',
+    });
+    try {
+      await recordFailedLoginAttempt(rtOauth.db, 'olarindevictor046@gmail.com', '198.51.100.7');
+      await recordFailedLoginAttempt(rtOauth.db, 'olarindevictor046@gmail.com', '198.51.100.7');
+      const oauthRes = await rtOauth.app.request('http://localhost:3000/api/auth/sign-in/social', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.7' },
+        body: JSON.stringify({ provider: 'google', callbackURL: '/api/auth/complete' }),
+      });
+      assert.equal(oauthRes.status, 200);
+    } finally {
+      fs.rmSync(rtOauth.tmpDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Admin Login Email Change (olarindevictor3@gmail.com -> olarindevictor046@gmail.com): verified migration preserves user ID & history, cleans stale OAuth, blocks old email & staff hijack', async () => {
+  const rt = createTestRuntime({
+    ownerEmail: 'olarindevictor046@gmail.com',
+    adminNotificationEmail: 'olarindevictor046@gmail.com',
+    googleClientId: 'mock-google-id',
+    googleClientSecret: 'mock-google-secret',
+  });
+  try {
+    await seedInitialStoreData(rt.db);
+
+    // Seed pre-migration active owner still on old email (olarindevictor3@gmail.com) with Google OAuth link, order & audit history
+    const { cookie: oldOwnerCookie, userId: ownerId } = await provisionAndSignInOwner(rt, {
+      email: 'olarindevictor3@gmail.com',
+      password: 'OwnerMigratePassword123!',
+    });
+
+    const authCtx = await rt.auth.$context;
+    await authCtx.internalAdapter.createAccount({
+      userId: ownerId,
+      providerId: 'google',
+      accountId: 'google-sub-old-owner-3',
+    });
+
+    // Seed a product & POS order so we verify store history stays intact after email change
+    const prods = await (await rt.app.request('http://localhost:3000/api/products')).json();
+    const firstProd = prods.products[0];
+    const firstVar = firstProd.variants[0];
+    const posRes = await rt.app.request('http://localhost:3000/api/admin/pos/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: oldOwnerCookie },
+      body: JSON.stringify({
+        items: [{ productId: firstProd.id, variantId: firstVar.id, quantity: 1 }],
+        customerName: 'History Check',
+        markPaid: true,
+      }),
+    });
+    assert.equal(posRes.status, 201);
+    const { orderId } = await posRes.json();
+
+    // Seed an existing customer and a staff admin account
+    const existingCust = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Existing Customer',
+        email: 'existing@customer.test',
+        password: 'CustomerPassword123!',
+      }),
+    });
+    assert.equal(existingCust.status, 200);
+
+    const createAdminRes = await rt.app.request('http://localhost:3000/api/admin/staff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: oldOwnerCookie },
+      body: JSON.stringify({
+        name: 'Staff Admin',
+        email: 'staff.admin@sellora.test',
+        password: 'StaffPassword123!',
+        role: 'admin',
+      }),
+    });
+    assert.equal(createAdminRes.status, 201);
+    const staffSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'staff.admin@sellora.test', password: 'StaffPassword123!' }),
+    });
+    const staffCookie = staffSignIn.headers.get('set-cookie')!.split(';')[0];
+
+    // 1. Pre-migration hijack protections: customer signup & OAuth create for olarindevictor046@gmail.com rejected while owner exists
+    const hijackSignup = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Attacker',
+        email: 'olarindevictor046@gmail.com',
+        password: 'AttackerPassword123!',
+      }),
+    });
+    assert.equal(hijackSignup.status, 403);
+    await assert.rejects(() =>
+      authCtx.internalAdapter.createUser(
+        { name: 'OAuth Hijack', email: 'olarindevictor046@gmail.com', emailVerified: true },
+        { method: 'oauth', oauth: { providerId: 'google' } }
+      )
+    );
+
+    // 2. Staff CANNOT invoke owner change-email or assign reserved owner email
+    const staffChangeOwnerRes = await rt.app.request('http://localhost:3000/api/admin/owner/change-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: staffCookie },
+      body: JSON.stringify({ newEmail: 'attacker@example.com' }),
+    });
+    assert.equal(staffChangeOwnerRes.status, 403);
+
+    const staffClaimReservedRes = await rt.app.request('http://localhost:3000/api/auth/change-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: staffCookie },
+      body: JSON.stringify({ newEmail: 'olarindevictor046@gmail.com' }),
+    });
+    assert.equal(staffClaimReservedRes.status, 403);
+
+    // 3. Duplicate existing account email rejected (409)
+    const dupRes = await rt.app.request('http://localhost:3000/api/admin/owner/change-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: oldOwnerCookie },
+      body: JSON.stringify({ newEmail: 'existing@customer.test' }),
+    });
+    assert.equal(dupRes.status, 409);
+
+    // 4. Settings summary surfaces emailMigrationPending = true while owner still has old email
+    const settingsBefore = await (
+      await rt.app.request('http://localhost:3000/api/admin/settings', {
+        headers: { Cookie: oldOwnerCookie },
+      })
+    ).json();
+    assert.equal(settingsBefore.ownerSummary.designatedOwnerEmail, 'olarindevictor046@gmail.com');
+    assert.equal(settingsBefore.ownerSummary.emailMigrationPending, true);
+
+    // 5. Initiate verified email change via /api/admin/owner/change-email
+    const reqChangeRes = await rt.app.request('http://localhost:3000/api/admin/owner/change-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: oldOwnerCookie },
+      body: JSON.stringify({ newEmail: 'olarindevictor046@gmail.com' }),
+    });
+    assert.equal(reqChangeRes.status, 200);
+
+    // Before verification links are clicked, owner email is UNCHANGED and new email CANNOT log in
+    const ownerBeforeVerify = await rt.db.get<{ email: string }>(`SELECT email FROM user WHERE id = ?`, [ownerId]);
+    assert.equal(ownerBeforeVerify?.email, 'olarindevictor3@gmail.com');
+    const unverifiedSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'OwnerMigratePassword123!',
+      }),
+    });
+    assert.equal(unverifiedSignIn.status, 401);
+
+    // Clear that 1 failed attempt on new email cleanly before completing migration
+    await clearLoginThrottle(rt.db, 'olarindevictor046@gmail.com', 'local');
+
+    // Step 1 confirmation email sent to olarindevictor3@gmail.com
+    const step1Email = await rt.db.get<{ recipient_email: string; html_body: string }>(
+      `SELECT recipient_email, html_body FROM email_notification_events WHERE notification_type = 'auth_change_email_confirmation' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(step1Email?.recipient_email, 'olarindevictor3@gmail.com');
+    const step1Url = step1Email!.html_body.match(/href="([^"]*verify-email[^"]*)"/)?.[1]!.replace(/&amp;/g, '&');
+    assert.ok(step1Url);
+
+    const step1Click = await rt.app.request(step1Url, { headers: { Cookie: oldOwnerCookie } });
+    assert.ok(step1Click.status === 200 || step1Click.status === 302);
+
+    // After Step 1 confirmation, email STILL has not flipped until new email is verified
+    const ownerAfterStep1 = await rt.db.get<{ email: string }>(`SELECT email FROM user WHERE id = ?`, [ownerId]);
+    assert.equal(ownerAfterStep1?.email, 'olarindevictor3@gmail.com');
+
+    // Step 2 verification email sent to olarindevictor046@gmail.com
+    const step2Email = await rt.db.get<{ recipient_email: string; html_body: string }>(
+      `SELECT recipient_email, html_body FROM email_notification_events WHERE notification_type = 'auth_verification' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(step2Email?.recipient_email, 'olarindevictor046@gmail.com');
+    const step2Url = step2Email!.html_body.match(/href="([^"]*verify-email[^"]*)"/)?.[1]!.replace(/&amp;/g, '&');
+    assert.ok(step2Url);
+
+    const step2Click = await rt.app.request(step2Url, { headers: { Cookie: oldOwnerCookie } });
+    assert.ok(step2Click.status === 200 || step2Click.status === 302);
+
+    // 6. Post-verification assertions: SAME user.id, SINGLE owner row, new verified email active, stale Google link deleted
+    const owners = await rt.db.all<{ id: string; email: string; emailVerified: number; role: string }>(
+      `SELECT id, email, emailVerified, role FROM user WHERE role = 'owner'`
+    );
+    assert.equal(owners.length, 1);
+    assert.equal(owners[0].id, ownerId);
+    assert.equal(owners[0].email, 'olarindevictor046@gmail.com');
+    assert.equal(owners[0].emailVerified, 1);
+
+    const staleGoogleLink = await rt.db.get<{ id: string }>(
+      `SELECT id FROM account WHERE userId = ? AND providerId = 'google'`,
+      [ownerId]
+    );
+    assert.equal(staleGoogleLink, null);
+
+    // Old email can NO LONGER authenticate with password; new email CAN with the existing password
+    const oldLoginRes = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'olarindevictor3@gmail.com',
+        password: 'OwnerMigratePassword123!',
+      }),
+    });
+    assert.equal(oldLoginRes.status, 401);
+
+    const newLoginRes = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'OwnerMigratePassword123!',
+      }),
+    });
+    assert.equal(newLoginRes.status, 200);
+    const newOwnerCookie = newLoginRes.headers.get('set-cookie')!.split(';')[0];
+
+    // Preserved store orders, audit logs, and emailMigrationPending === false
+    const orderCheck = await (
+      await rt.app.request(`http://localhost:3000/api/admin/orders/${orderId}`, {
+        headers: { Cookie: newOwnerCookie },
+      })
+    ).json();
+    assert.equal(orderCheck.order.order_id, orderId);
+
+    const settingsAfter = await (
+      await rt.app.request('http://localhost:3000/api/admin/settings', {
+        headers: { Cookie: newOwnerCookie },
+      })
+    ).json();
+    assert.equal(settingsAfter.ownerSummary.emailMigrationPending, false);
+    assert.equal(settingsAfter.emailStatus.resolvedAdminEmail, 'olarindevictor046@gmail.com');
+
+    // Audit log & security events recorded WITHOUT verification tokens
+    const auditChanged = await rt.db.get<{ details_json: string }>(
+      `SELECT details_json FROM audit_logs WHERE action = 'OWNER_EMAIL_CHANGED' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.ok(auditChanged);
+    assert.equal(auditChanged.details_json.includes('token='), false);
+  } finally {
+    fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Admin Notification Routing (olarindevictor046@gmail.com): order & security alerts, preserved Brevo sender, account-specific resets/lockouts & zero legacy fallback', async () => {
+  const rt = createTestRuntime({
+    ownerEmail: 'olarindevictor046@gmail.com',
+    brevoApiKey: 'xkeysib-test-sender-key',
+    brevoFromEmail: 'noreply@sellora-sender.example',
+    brevoFromName: 'SELLORA Store',
+  });
+  const sentPayloads: Array<{ sender: { name?: string; email?: string }; to: Array<{ email: string }>; subject: string }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('api.brevo.com/v3/smtp/email')) {
+      const parsed = JSON.parse(String(init?.body || '{}'));
+      sentPayloads.push(parsed);
+      return new Response(JSON.stringify({ messageId: `<brevo-${sentPayloads.length}@test>` }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    await seedInitialStoreData(rt.db);
+
+    // 1. Default ADMIN_NOTIFICATION_EMAIL and test recipient resolve to olarindevictor046@gmail.com while BREVO_FROM_EMAIL stays untouched
+    const eff = await getEffectiveEmailConfig(rt.db, rt.env);
+    assert.equal(eff.adminNotificationEmail, 'olarindevictor046@gmail.com');
+    assert.equal(eff.testEmailRecipient, 'olarindevictor046@gmail.com');
+    assert.equal(eff.fromEmail, 'noreply@sellora-sender.example');
+    assert.equal(eff.fromName, 'SELLORA');
+
+    // Provision owner, create staff account & sign up customer
+    const { cookie: ownerCookie } = await provisionAndSignInOwner(rt, {
+      email: 'olarindevictor046@gmail.com',
+      password: 'StrongOwnerPassword123!',
+    });
+
+    const settingsRes = await (
+      await rt.app.request('http://localhost:3000/api/admin/settings', {
+        headers: { Cookie: ownerCookie },
+      })
+    ).json();
+    assert.equal(settingsRes.emailStatus.resolvedAdminEmail, 'olarindevictor046@gmail.com');
+    assert.equal(settingsRes.emailStatus.resolvedFromEmail, 'noreply@sellora-sender.example');
+
+    const staffRes = await rt.app.request('http://localhost:3000/api/admin/staff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+      body: JSON.stringify({
+        name: 'Staff Member',
+        email: 'staff.ops@sellora.test',
+        password: 'StaffPassword123!',
+        role: 'order_staff',
+      }),
+    });
+    assert.equal(staffRes.status, 201);
+
+    const custSignup = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Ada Obi',
+        email: 'ada.obi@sellora.test',
+        password: 'CustomerPassword123!',
+      }),
+    });
+    assert.equal(custSignup.status, 200);
+
+    // 2. New customer admin notification goes to olarindevictor046@gmail.com; welcome/verification go to customer
+    const adminCustAlert = await rt.db.get<{ recipient_email: string }>(
+      `SELECT recipient_email FROM email_notification_events WHERE notification_type = 'new_customer' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(adminCustAlert?.recipient_email, 'olarindevictor046@gmail.com');
+
+    // 3. New order notifications route admin alert to olarindevictor046@gmail.com and customer alert to ada.obi@sellora.test
+    await triggerOrderNotifications(rt.db, rt.env, {
+      eventKey: 'new_order',
+      orderId: 'ord_notif_route_1',
+      orderNumber: 'SLR-20261116-ROUTE1',
+      customerName: 'Ada Obi',
+      customerEmail: 'ada.obi@sellora.test',
+      statusLabel: 'Pending Bank Transfer',
+      totalFormatted: '₦85,000',
+      customerTitle: 'Order Placed',
+      customerIntro: 'Thank you for your order.',
+      adminTitle: 'New Order Received',
+      adminIntro: 'A new customer order requires review.',
+    });
+
+    const orderEmails = await rt.db.all<{ recipient_email: string; recipient_type: string }>(
+      `SELECT recipient_email, recipient_type FROM email_notification_events WHERE order_id = 'ord_notif_route_1'`
+    );
+    assert.equal(orderEmails.find((e) => e.recipient_type === 'admin')?.recipient_email, 'olarindevictor046@gmail.com');
+    assert.equal(orderEmails.find((e) => e.recipient_type === 'customer')?.recipient_email, 'ada.obi@sellora.test');
+
+    // 4. Disputed security alert goes to olarindevictor046@gmail.com while new-device alert goes to customer's registered email
+    const custUser = await rt.db.get<{ id: string }>(`SELECT id FROM user WHERE email = 'ada.obi@sellora.test'`);
+    await recordLoginAttemptAndMonitor(rt.db, rt.env, {
+      headers: new Headers({
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0',
+        'cf-ipcountry': 'NG',
+      }),
+      userId: custUser!.id,
+      email: 'ada.obi@sellora.test',
+      userName: 'Ada Obi',
+      userRole: 'customer',
+      authMethod: 'email_password',
+      outcome: 'success',
+    });
+    const loginMon = await recordLoginAttemptAndMonitor(rt.db, rt.env, {
+      headers: new Headers({
+        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1',
+        'cf-ipcountry': 'GB',
+      }),
+      userId: custUser!.id,
+      email: 'ada.obi@sellora.test',
+      userName: 'Ada Obi',
+      userRole: 'customer',
+      authMethod: 'email_password',
+      outcome: 'success',
+    });
+    assert.ok(loginMon.disputeUrl);
+    const deviceAlert = await rt.db.get<{ recipient_email: string }>(
+      `SELECT recipient_email FROM email_notification_events WHERE notification_type = 'security_new_device_login' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(deviceAlert?.recipient_email, 'ada.obi@sellora.test');
+
+    const disputeToken = new URL(loginMon.disputeUrl!).searchParams.get('token')!;
+    const disputeRes = await rt.app.request(
+      `http://localhost:3000/api/security/login-response?action=dispute&token=${encodeURIComponent(disputeToken)}`
+    );
+    assert.equal(disputeRes.status, 200);
+    const disputedAdminAlert = await rt.db.get<{ recipient_email: string }>(
+      `SELECT recipient_email FROM email_notification_events WHERE notification_type = 'security_disputed_login' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(disputedAdminAlert?.recipient_email, 'olarindevictor046@gmail.com');
+
+    // 5. Login lockout alerts continue reaching the affected account's registered email (staff & customer)
+    for (let i = 0; i < 2; i++) {
+      await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'staff.ops@sellora.test', password: 'WrongPassword!' }),
+      });
+    }
+    const staffLockoutEmail = await rt.db.get<{ recipient_email: string }>(
+      `SELECT recipient_email FROM email_notification_events WHERE notification_type = 'security_login_lockout' AND recipient_email = 'staff.ops@sellora.test' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(staffLockoutEmail?.recipient_email, 'staff.ops@sellora.test');
+
+    // 6. Password reset uses the requesting account's own registered email
+    const resetReq = await rt.app.request('http://localhost:3000/api/auth/request-password-reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'staff.ops@sellora.test', redirectTo: 'http://localhost:3000/' }),
+    });
+    assert.equal(resetReq.status, 200);
+    const resetEvent = await rt.db.get<{ recipient_email: string }>(
+      `SELECT recipient_email FROM email_notification_events WHERE notification_type = 'auth_password_reset' ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.equal(resetEvent?.recipient_email, 'staff.ops@sellora.test');
+
+    // 7. Verify Brevo sender remained untouched across all dispatched emails and zero emails went to olarindevictor3@gmail.com
+    assert.ok(sentPayloads.length > 0);
+    assert.ok(sentPayloads.every((p) => p.sender.email === 'noreply@sellora-sender.example'));
+    const legacyRecipients = await rt.db.all<{ event_id: string }>(
+      `SELECT event_id FROM email_notification_events WHERE recipient_email = 'olarindevictor3@gmail.com'`
+    );
+    assert.equal(legacyRecipients.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Fail-Closed Login Security: DB failures, missing lockout_cycles migration, safe HTTP 503 & progressive 10m/15m/20m lockout + recovery', async () => {
+  // Part A: Initial lockout check DB failure & failed-attempt persistence DB failure MUST fail closed (HTTP 503, zero leaks)
+  const rt = createTestRuntime({ loginMaxLockoutSeconds: 1200 });
+  try {
+    await seedInitialStoreData(rt.db);
+    await provisionOwnerInDb(rt.db, {
+      name: 'Victor Olarinde',
+      email: 'olarindevictor046@gmail.com',
+      password: 'CorrectFailClosedPassword123!',
+    });
+
+    // 1. Direct unit check + HTTP route check when initial lockout DB query throws (even with CORRECT password)
+    const origAll = rt.db.all.bind(rt.db);
+    (rt.db as any).all = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('auth_login_throttles')) {
+        throw new Error('SQLITE_ERROR: simulated auth_login_throttles read outage /app/applet/secret');
+      }
+      return origAll(sql, params);
+    };
+
+    const directCheckFail = await checkLoginThrottle(rt.db, 'olarindevictor046@gmail.com', '198.51.100.40');
+    assert.equal(directCheckFail.allowed, false);
+    assert.equal(directCheckFail.unavailable, true);
+
+    const checkFailHttp = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.40' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'CorrectFailClosedPassword123!',
+      }),
+    });
+    assert.equal(checkFailHttp.status, 503);
+    assert.equal(checkFailHttp.headers.get('set-cookie'), null); // Auth NEVER proceeds
+    const checkFailBody = await checkFailHttp.json();
+    assert.match(checkFailBody.referenceId || '', /^ERR-[A-Z2-9]{8}$/);
+    assert.equal(JSON.stringify(checkFailBody).includes('SQLITE_ERROR'), false);
+    assert.equal(JSON.stringify(checkFailBody).includes('auth_login_throttles'), false);
+    assert.equal(JSON.stringify(checkFailBody).includes('/app/applet'), false);
+    (rt.db as any).all = origAll;
+
+    // 2. Direct unit check + HTTP route check when recording a failed login attempt throws -> HTTP 503 (NOT 401!)
+    const origRun = rt.db.run.bind(rt.db);
+    (rt.db as any).run = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('INSERT INTO auth_login_throttles')) {
+        throw new Error('SQLITE_BUSY: database is locked on auth_login_throttles');
+      }
+      return origRun(sql, params);
+    };
+
+    const directRecordFail = await recordFailedLoginAttempt(rt.db, 'olarindevictor046@gmail.com', '198.51.100.41');
+    assert.equal(directRecordFail.locked, true);
+    assert.equal(directRecordFail.unavailable, true);
+
+    const recordFailHttp = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.41' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'WrongPasswordAttempt!',
+      }),
+    });
+    assert.equal(recordFailHttp.status, 503);
+    const recordFailBody = await recordFailHttp.json();
+    assert.match(recordFailBody.referenceId || '', /^ERR-[A-Z2-9]{8}$/);
+    assert.equal(JSON.stringify(recordFailBody).includes('SQLITE_BUSY'), false);
+    assert.equal(JSON.stringify(recordFailBody).includes('auth_login_throttles'), false);
+    (rt.db as any).run = origRun;
+
+    // 3. Normal successful login works when DB is healthy
+    const okLogin = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'CorrectFailClosedPassword123!',
+      }),
+    });
+    assert.equal(okLogin.status, 200);
+    assert.ok(okLogin.headers.get('set-cookie'));
+
+    // 4. First incorrect attempt (401) -> Second incorrect attempt (10m = 600s lockout, 429) -> 15m (900s) -> 20m (1200s max cap)
+    const f1 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'Wrong1!' }),
+    });
+    assert.equal(f1.status, 401);
+
+    const f2 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'Wrong2!' }),
+    });
+    assert.equal(f2.status, 429);
+    const r2 = Number(f2.headers.get('retry-after'));
+    assert.ok(r2 >= 595 && r2 <= 600);
+
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const f3 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'Wrong3!' }),
+    });
+    assert.equal(f3.status, 429);
+    const r3 = Number(f3.headers.get('retry-after'));
+    assert.ok(r3 >= 895 && r3 <= 900);
+
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const f4 = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'Wrong4!' }),
+    });
+    assert.equal(f4.status, 429);
+    const r4 = Number(f4.headers.get('retry-after'));
+    assert.ok(r4 >= 1195 && r4 <= 1200);
+
+    await rt.db.run(
+      `UPDATE auth_login_throttles SET locked_until_ms = ? WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`,
+      [Date.now() - 1000]
+    );
+    const f5Capped = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'Wrong5!' }),
+    });
+    assert.equal(f5Capped.status, 429);
+    const r5 = Number(f5Capped.headers.get('retry-after'));
+    assert.ok(r5 >= 1195 && r5 <= 1200);
+
+    // 5. Verified password reset clears lockout cleanly
+    await rt.app.request('http://localhost:3000/api/auth/request-password-reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', redirectTo: 'http://localhost:3000/' }),
+    });
+    const resetRow = await rt.db.get<{ html_body: string }>(
+      `SELECT html_body FROM email_notification_events WHERE notification_type = 'auth_password_reset' ORDER BY created_at DESC LIMIT 1`
+    );
+    const resetHref = resetRow!.html_body.match(/href="([^"]*reset-password[^"]*)"/)![1].replace(/&amp;/g, '&');
+    const resetToken =
+      new URL(resetHref).searchParams.get('token') || new URL(resetHref).pathname.split('/').filter(Boolean).pop()!;
+    const resetDone = await rt.app.request('http://localhost:3000/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: 'NewFailClosedPassword123!', token: resetToken }),
+    });
+    assert.equal(resetDone.status, 200);
+
+    // 1 wrong attempt followed by successful login clears lockout counter completely
+    const postResetWrong = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'WrongAfterReset!' }),
+    });
+    assert.equal(postResetWrong.status, 401);
+
+    const postResetOk = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.42' },
+      body: JSON.stringify({ email: 'olarindevictor046@gmail.com', password: 'NewFailClosedPassword123!' }),
+    });
+    assert.equal(postResetOk.status, 200);
+    const clearedRow = await rt.db.get<{ fail_count: number }>(
+      `SELECT fail_count FROM auth_login_throttles WHERE throttle_key = 'acct:olarindevictor046@gmail.com'`
+    );
+    assert.equal(clearedRow, null);
+  } finally {
+    fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+  }
+
+  // Part B: Missing / unapplied migration 0006 (auth_login_throttles missing lockout_cycles column) MUST fail closed (503)
+  const partialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sellora-partial-mig-'));
+  const partialMigDir = path.join(partialDir, 'migrations');
+  fs.mkdirSync(partialMigDir, { recursive: true });
+  for (const fname of [
+    '0001_initial.sql',
+    '0002_security_indexes.sql',
+    '0003_seo_analytics.sql',
+    '0004_atomic_checkout_guards.sql',
+    '0005_three_layer_security.sql',
+  ]) {
+    fs.copyFileSync(path.resolve(process.cwd(), 'migrations', fname), path.join(partialMigDir, fname));
+  }
+  const partialDb = createSqliteDb(path.join(partialDir, 'partial.db'), partialMigDir);
+  const partialStorage = createLocalStorage(path.join(partialDir, 'r2'));
+  const partialEnv: AppEnvConfig = {
+    betterAuthSecret: 'test-secret-012345678901234567890123456789',
+    ownerEmail: 'olarindevictor046@gmail.com',
+    appUrl: 'http://localhost:3000',
+  };
+  const partialAuth = createSelloraAuth({
+    database: partialDb.rawSqlite!,
+    db: partialDb,
+    baseURL: partialEnv.appUrl!,
+    secret: partialEnv.betterAuthSecret,
+    emailEnv: partialEnv,
+    ownerEmail: partialEnv.ownerEmail,
+  });
+  const partialApp = createSelloraApiApp({
+    db: partialDb,
+    storage: partialStorage,
+    auth: partialAuth,
+    env: partialEnv,
+  });
+  try {
+    await seedInitialStoreData(partialDb);
+    await provisionOwnerInDb(partialDb, {
+      name: 'Victor Olarinde',
+      email: 'olarindevictor046@gmail.com',
+      password: 'PartialMigrationPassword123!',
+    });
+
+    const missingColCheck = await checkLoginThrottle(partialDb, 'olarindevictor046@gmail.com', '198.51.100.50');
+    assert.equal(missingColCheck.allowed, false);
+    assert.equal(missingColCheck.unavailable, true);
+
+    const missingColRecord = await recordFailedLoginAttempt(partialDb, 'olarindevictor046@gmail.com', '198.51.100.50');
+    assert.equal(missingColRecord.locked, true);
+    assert.equal(missingColRecord.unavailable, true);
+
+    const missingColHttp = await partialApp.request('http://localhost:3000/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': '198.51.100.50' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'PartialMigrationPassword123!',
+      }),
+    });
+    assert.equal(missingColHttp.status, 503);
+    assert.equal(missingColHttp.headers.get('set-cookie'), null);
+    const missingBody = await missingColHttp.json();
+    assert.match(missingBody.referenceId || '', /^ERR-[A-Z2-9]{8}$/);
+    assert.equal(JSON.stringify(missingBody).includes('lockout_cycles'), false);
+    assert.equal(JSON.stringify(missingBody).includes('no such column'), false);
+  } finally {
+    fs.rmSync(partialDir, { recursive: true, force: true });
+  }
+});
+
+function createInMemoryR2Bucket(): R2LikeBucket & { keys: () => string[] } {
+  const objects = new Map<string, { data: Uint8Array; contentType: string; uploaded: Date }>();
+  return {
+    keys() {
+      return Array.from(objects.keys());
+    },
+    async put(key: string, value: Uint8Array, options?: { httpMetadata?: { contentType?: string } }) {
+      objects.set(key, {
+        data: new Uint8Array(value),
+        contentType: options?.httpMetadata?.contentType || 'application/octet-stream',
+        uploaded: new Date(),
+      });
+    },
+    async get(key: string) {
+      const entry = objects.get(key);
+      if (!entry) return null;
+      return {
+        httpMetadata: { contentType: entry.contentType },
+        async arrayBuffer() {
+          return entry.data.slice().buffer;
+        },
+      };
+    },
+    async delete(key: string) {
+      objects.delete(key);
+    },
+    async list(options?: { prefix?: string }) {
+      const prefix = options?.prefix || '';
+      const matched = Array.from(objects.entries())
+        .filter(([k]) => !prefix || k.startsWith(prefix))
+        .map(([k, v]) => ({ key: k, uploaded: v.uploaded }));
+      return { objects: matched, truncated: false };
+    },
+  };
+}
+
+test('Cloudflare Worker runtime routes all DB & media operations through D1 and R2 and supports Web, Android & iOS clients', async () => {
+  const migrationsDir = path.resolve(process.cwd(), 'migrations');
+  const d1Raw = createInMemoryD1Shim(migrationsDir);
+  const r2Bucket = createInMemoryR2Bucket();
+  const db = createD1Db(d1Raw);
+
+  const workerEnv: WorkerEnv = {
+    DB: d1Raw,
+    R2_MEDIA: r2Bucket,
+    ASSETS: {
+      async fetch() {
+        return new Response('<html><head><title>SELLORA</title></head><body>OK</body></html>', {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      },
+    },
+    APP_URL: 'https://sellora-commerce.example.workers.dev',
+    BETTER_AUTH_SECRET: 'worker-prod-secret-012345678901234567890123456',
+    OWNER_EMAIL: 'olarindevictor046@gmail.com',
+    ADMIN_NOTIFICATION_EMAIL: 'olarindevictor046@gmail.com',
+    LOGIN_MAX_LOCKOUT_SECONDS: '3600',
+  };
+
+  // 1. Fail-closed when DB or R2_MEDIA binding is missing
+  const noDbRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/health'),
+    { ...workerEnv, DB: undefined as any }
+  );
+  assert.equal(noDbRes.status, 503);
+
+  const noR2Res = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/products'),
+    { ...workerEnv, R2_MEDIA: undefined as any }
+  );
+  assert.equal(noR2Res.status, 503);
+
+  // 2. Public /api/health returns OK without leaking provider strings, while owner-only /api/admin/infrastructure-status reports Cloudflare D1 + R2
+  const healthRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/health') as any,
+    workerEnv
+  );
+  assert.equal(healthRes.status, 200);
+  const healthText = await healthRes.text();
+  assert.equal(healthText.includes('cloudflare'), false);
+  assert.equal(healthText.includes('d1'), false);
+  assert.equal(JSON.parse(healthText).ok, true);
+
+  // 3. Provision owner into D1 & verify Worker sign-in, owner-only infrastructure check, and R2 media upload / read / delete
+  await provisionOwnerInDb(db, {
+    name: 'Victor Olarinde',
+    email: 'olarindevictor046@gmail.com',
+    password: 'WorkerOwnerPassword123!',
+  });
+
+  const signInRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'olarindevictor046@gmail.com',
+        password: 'WorkerOwnerPassword123!',
+      }),
+    }),
+    workerEnv
+  );
+  assert.equal(signInRes.status, 200);
+  const ownerCookie = signInRes.headers.get('set-cookie')!.split(';')[0];
+
+  const unauthInfraRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/infrastructure-status'),
+    workerEnv
+  );
+  assert.equal(unauthInfraRes.status, 401);
+
+  const infraRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/infrastructure-status', {
+      headers: { Cookie: ownerCookie },
+    }),
+    workerEnv
+  );
+  assert.equal(infraRes.status, 200);
+  const infraJson = await infraRes.json();
+  assert.equal(infraJson.runtime, 'cloudflare-worker');
+  assert.equal(infraJson.database, 'cloudflare-d1');
+  assert.equal(infraJson.storage, 'cloudflare-r2');
+  assert.equal(infraJson.environment, 'production');
+
+  const validPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  const mediaForm = new FormData();
+  mediaForm.append('file', new File([validPng], 'hero.png', { type: 'image/png' }));
+  const uploadRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/media/upload', {
+      method: 'POST',
+      headers: { Cookie: ownerCookie },
+      body: mediaForm,
+    }),
+    workerEnv
+  );
+  assert.equal(uploadRes.status, 201);
+  const uploadJson = await uploadRes.json();
+  assert.match(uploadJson.url, /^\/api\/media\/products\/prod_.*\.png$/);
+  const uploadedFile = uploadJson.url.split('/').pop()!;
+  assert.equal(r2Bucket.keys().includes(`products/${uploadedFile}`), true);
+
+  // Public media read routes directly through Worker env.R2_MEDIA
+  const readMediaRes = await workerEntry.fetch(
+    new Request(`https://sellora-commerce.example.workers.dev${uploadJson.url}`),
+    workerEnv
+  );
+  assert.equal(readMediaRes.status, 200);
+  assert.equal(readMediaRes.headers.get('content-type'), 'image/png');
+
+  // Create product referencing the R2 asset, confirm deletion is blocked while referenced, then delete product
+  const createProdRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+      body: JSON.stringify({
+        name: 'Cloudflare R2 Studio Speaker',
+        priceNaira: 95000,
+        stockQuantity: 10,
+        media: [uploadJson.url],
+      }),
+    }),
+    workerEnv
+  );
+  assert.equal(createProdRes.status, 201);
+  const createProdJson = await createProdRes.json();
+
+  const blockedDeleteMedia = await workerEntry.fetch(
+    new Request(`https://sellora-commerce.example.workers.dev/api/admin/media/${uploadedFile}`, {
+      method: 'DELETE',
+      headers: { Cookie: ownerCookie },
+    }),
+    workerEnv
+  );
+  assert.equal(blockedDeleteMedia.status, 409);
+
+  const deleteProdRes = await workerEntry.fetch(
+    new Request(`https://sellora-commerce.example.workers.dev/api/admin/products/${createProdJson.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: ownerCookie },
+    }),
+    workerEnv
+  );
+  assert.equal(deleteProdRes.status, 200);
+  // Deleting product cleanly removed unreferenced R2 object
+  assert.equal(r2Bucket.keys().includes(`products/${uploadedFile}`), false);
+
+  // 4. Upload second unreferenced file and delete via explicit DELETE /api/admin/media/:file
+  const mediaForm2 = new FormData();
+  mediaForm2.append('file', new File([validPng], 'standalone.png', { type: 'image/png' }));
+  const upload2Res = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/media/upload', {
+      method: 'POST',
+      headers: { Cookie: ownerCookie },
+      body: mediaForm2,
+    }),
+    workerEnv
+  );
+  assert.equal(upload2Res.status, 201);
+  const file2 = (await upload2Res.json()).url.split('/').pop()!;
+  const delMediaRes = await workerEntry.fetch(
+    new Request(`https://sellora-commerce.example.workers.dev/api/admin/media/${file2}`, {
+      method: 'DELETE',
+      headers: { Cookie: ownerCookie },
+    }),
+    workerEnv
+  );
+  assert.equal(delMediaRes.status, 200);
+  assert.equal(r2Bucket.keys().includes(`products/${file2}`), false);
+
+  // 5. Android & iOS Capacitor origins share the Worker API cleanly while untrusted origins stay blocked
+  const androidMutRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/cart', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'https://localhost',
+        'Sec-Fetch-Site': 'cross-site',
+        'x-cart-token': 'cart_android_1',
+      },
+      body: JSON.stringify({ items: [] }),
+    }),
+    workerEnv
+  );
+  assert.equal(androidMutRes.status, 200);
+  assert.equal(androidMutRes.headers.get('access-control-allow-origin'), 'https://localhost');
+
+  const iosMutRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/cart', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'capacitor://localhost',
+        'Sec-Fetch-Site': 'cross-site',
+        'x-cart-token': 'cart_ios_1',
+      },
+      body: JSON.stringify({ items: [] }),
+    }),
+    workerEnv
+  );
+  assert.equal(iosMutRes.status, 200);
+  assert.equal(iosMutRes.headers.get('access-control-allow-origin'), 'capacitor://localhost');
+
+  const evilOriginRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/cart', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'https://evil-store.example',
+        'Sec-Fetch-Site': 'cross-site',
+      },
+      body: JSON.stringify({ items: [] }),
+    }),
+    workerEnv
+  );
+  assert.equal(evilOriginRes.status, 403);
+
+  // 6. Frontend & Capacitor URL helpers resolve relative /api paths consistently
+  assert.equal(resolveApiUrl('/api/products', ''), '/api/products');
+  assert.equal(
+    resolveApiUrl('/api/products', 'https://sellora-commerce.example.workers.dev/'),
+    'https://sellora-commerce.example.workers.dev/api/products'
+  );
+  assert.equal(
+    resolveMediaUrl('/api/media/products/prod_1.png', 'https://sellora-commerce.example.workers.dev'),
+    'https://sellora-commerce.example.workers.dev/api/media/products/prod_1.png'
+  );
+  assert.equal(
+    resolveMediaUrl('/src/assets/images/hero_sellora_editorial_1794648058731.jpg', 'https://sellora-commerce.example.workers.dev'),
+    '/src/assets/images/hero_sellora_editorial_1794648058731.jpg'
+  );
+});
+
+
+
+

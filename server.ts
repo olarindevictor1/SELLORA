@@ -9,12 +9,20 @@ import { createSqliteDb, createLocalStorage } from './src/server/db-node';
 import { seedInitialStoreData } from './src/server/seed';
 import { createSelloraAuth } from './src/server/auth';
 import { createSelloraApiApp } from './src/server/app';
+import { recordCapturedError } from './src/server/error-monitor';
+import { resolveMaxLockoutSeconds } from './src/server/security';
 import { generateRobotsTxt, generateSitemapXml, renderSeoHtmlResponse } from './src/server/seo';
 import type { AppEnvConfig } from './src/server/context';
 
 async function startServer() {
   const port = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
+
+  if (isProd && process.env.ALLOW_LOCAL_DEV_SQLITE !== 'true') {
+    throw new Error(
+      'Refusing to start local Node/SQLite server in production mode (NODE_ENV=production). Production SELLORA must deploy via Cloudflare Workers (worker/index.ts) backed by Cloudflare D1 (DB) and Cloudflare R2 (R2_MEDIA).'
+    );
+  }
 
   const dbPath = process.env.SQLITE_DB_PATH || './.data/sellora.db';
   const migrationsDir = path.resolve(process.cwd(), 'migrations');
@@ -37,14 +45,19 @@ async function startServer() {
   }
 
   const appUrl = (process.env.APP_URL || `http://localhost:${port}`).trim();
+  const corsAllowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const envConfig: AppEnvConfig = {
     betterAuthSecret: authSecret,
-    ownerEmail: (process.env.OWNER_EMAIL || 'olarindevictor3@gmail.com').trim(),
+    ownerEmail: (process.env.OWNER_EMAIL || 'olarindevictor046@gmail.com').trim(),
     brevoApiKey: process.env.BREVO_API_KEY?.trim() || undefined,
     brevoFromEmail: process.env.BREVO_FROM_EMAIL?.trim() || undefined,
     brevoFromName: (process.env.BREVO_FROM_NAME || 'SELLORA').trim(),
     adminNotificationEmail:
-      (process.env.ADMIN_NOTIFICATION_EMAIL || 'olarindevictor3@gmail.com').trim(),
+      (process.env.ADMIN_NOTIFICATION_EMAIL || 'olarindevictor046@gmail.com').trim(),
     brevoWebhookSecret: process.env.BREVO_WEBHOOK_SECRET?.trim() || undefined,
     turnstileSecretKey: process.env.TURNSTILE_SECRET_KEY?.trim() || undefined,
     turnstileSiteKey:
@@ -58,10 +71,15 @@ async function startServer() {
       undefined,
     geminiApiKey: process.env.GEMINI_API_KEY?.trim() || undefined,
     appUrl,
+    runtime: 'node',
+    environment: 'local-development',
+    trustedProxy: process.env.TRUSTED_PROXY === 'true' || isProd,
+    loginMaxLockoutSeconds: resolveMaxLockoutSeconds(process.env.LOGIN_MAX_LOCKOUT_SECONDS),
+    corsAllowedOrigins: corsAllowedOrigins.length > 0 ? corsAllowedOrigins : undefined,
   };
 
   if (!db.rawSqlite) {
-    throw new Error('SQLite connection required for Node server runtime.');
+    throw new Error('SQLite connection required for Node local development runtime.');
   }
 
   const auth = createSelloraAuth({
@@ -73,6 +91,7 @@ async function startServer() {
     ownerEmail: envConfig.ownerEmail,
     googleClientId: envConfig.googleClientId,
     googleClientSecret: envConfig.googleClientSecret,
+    corsAllowedOrigins: envConfig.corsAllowedOrigins,
   });
 
   const apiApp = createSelloraApiApp({
@@ -82,8 +101,13 @@ async function startServer() {
     env: envConfig,
   });
 
+  console.warn(
+    '[SELLORA LOCAL DEV] Running on local SQLite (./.data/sellora.db) & local disk (./.data/r2) — development/preview only, never production.'
+  );
+
   const app = express();
-  app.set('trust proxy', true);
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
 
   // Dynamic robots.txt and XML Sitemap backed by store_settings.seo & real active DB records
   app.get('/robots.txt', async (req, res) => {
@@ -140,8 +164,17 @@ async function startServer() {
       const buf = Buffer.from(await webRes.arrayBuffer());
       res.send(buf);
     } catch (err) {
-      console.error('[SELLORA API Error]', err);
-      res.status(500).json({ error: 'Internal server error' });
+      const captured = await recordCapturedError(db, {
+        serviceCategory: 'api',
+        failedOperation: `express_api_bridge:${req.method} ${req.originalUrl}`,
+        location: req.originalUrl,
+        environment: envConfig.environment || 'development',
+        error: err,
+      });
+      res.status(500).json({
+        error: 'Something went wrong while completing your request. Please try again.',
+        referenceId: captured.refId,
+      });
     }
   });
 
@@ -165,7 +198,15 @@ async function startServer() {
         const template = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf8');
         const transformed = await vite.transformIndexHtml(req.originalUrl, template);
         const { html: withSeo, status } = await renderSeoHtmlResponse(transformed, url, db, envConfig);
-        res.status(status).set({ 'Content-Type': 'text/html; charset=utf-8' }).end(withSeo);
+        res
+          .status(status)
+          .set({
+            'Content-Type': 'text/html; charset=utf-8',
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'strict-origin-when-cross-origin',
+            'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+          })
+          .end(withSeo);
       } catch (e) {
         vite.ssrFixStacktrace(e as Error);
         next(e);
@@ -179,7 +220,15 @@ async function startServer() {
       const url = new URL(req.originalUrl, origin);
       const html = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8');
       const { html: withSeo, status } = await renderSeoHtmlResponse(html, url, db, envConfig);
-      res.status(status).set({ 'Content-Type': 'text/html; charset=utf-8' }).end(withSeo);
+      res
+        .status(status)
+        .set({
+          'Content-Type': 'text/html; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'strict-origin-when-cross-origin',
+          'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+        })
+        .end(withSeo);
     });
   }
 

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { AlertCircle, Download, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, resolveApiUrl } from '../../lib/api';
 import { formatNgn, ORDER_STATUS_LABELS, type OrderStatus } from '../../shared/types';
 import {
   InteractiveDonutChart,
@@ -241,7 +241,7 @@ export const AdminAnalyticsTab: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-[#172554]">Analytics & Financial Overview</h2>
           <p className="text-xs text-slate-500">
-            All metrics reflect verified D1/SQLite database records. Unverified receipts are separated from confirmed revenue.
+            All metrics reflect verified store order and payment records. Unverified receipts are separated from confirmed revenue.
           </p>
         </div>
 
@@ -291,7 +291,7 @@ export const AdminAnalyticsTab: React.FC = () => {
             aria-label="To date"
           />
           <a
-            href="/api/admin/orders/export"
+            href={resolveApiUrl('/api/admin/orders/export')}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-[#172554] hover:bg-slate-50"
           >
             <Download className="w-3.5 h-3.5" /> Export CSV
@@ -405,7 +405,7 @@ export const AdminAnalyticsTab: React.FC = () => {
           data={deviceDonutData}
           centerLabel="Visitors"
           valueFormatter={(v) => v.toLocaleString()}
-          emptyTitle="No device telemetry yet"
+          emptyTitle="No device activity yet"
           emptyDescription="Device categories populate automatically as customers visit public pages."
         />
 
@@ -478,7 +478,7 @@ export const AdminAnalyticsTab: React.FC = () => {
           <div>
             <h3 className="text-sm font-bold text-[#172554]">Storefront Conversion Funnel</h3>
             <p className="text-xs text-slate-500">
-              First-party non-PII funnel events in D1 alongside GA4 telemetry. External GA4 queries require Google Analytics Data API.
+              Storefront shopping activity from product views to confirmed purchases.
             </p>
           </div>
           <span className="text-xs font-bold text-[#172554] tabular-nums">

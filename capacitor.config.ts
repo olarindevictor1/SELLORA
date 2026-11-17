@@ -4,6 +4,7 @@ interface CapacitorConfig {
   webDir: string;
   server?: {
     androidScheme?: string;
+    iosScheme?: string;
     url?: string;
     cleartext?: boolean;
   };
@@ -12,6 +13,11 @@ interface CapacitorConfig {
     allowMixedContent?: boolean;
     captureInput?: boolean;
     webContentsDebuggingEnabled?: boolean;
+  };
+  ios?: {
+    backgroundColor?: string;
+    contentInset?: string;
+    limitsNavigationsToAppBoundDomains?: boolean;
   };
   plugins?: Record<string, unknown>;
 }
@@ -22,13 +28,20 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     androidScheme: 'https',
-    // Set url during live remote-hosted builds or leave bundled with VITE_API_BASE_URL
+    iosScheme: 'capacitor',
+    cleartext: false,
+    // Bundled WebView builds use VITE_API_BASE_URL (e.g. https://sellora-commerce.<subdomain>.workers.dev)
+    // to share the Cloudflare Worker API, D1 database, and R2 media endpoints with Web.
   },
   android: {
     backgroundColor: '#172554',
     allowMixedContent: false,
     captureInput: true,
     webContentsDebuggingEnabled: false,
+  },
+  ios: {
+    backgroundColor: '#172554',
+    contentInset: 'automatic',
   },
   plugins: {
     SplashScreen: {

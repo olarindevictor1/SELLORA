@@ -2,8 +2,21 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomHex, randomUuid } from '../crypto';
 import type { AppContext } from '../context';
+import {
+  extractDbGuardCode,
+  isUniqueConstraintError,
+  type BatchStatement,
+} from '../db';
 import { triggerOrderNotifications } from '../email';
-import { checkRateLimit, verifyTurnstileToken, writeAuditLog } from '../security';
+import { respondWithCapturedError } from '../error-monitor';
+import {
+  checkPersistentRateLimit,
+  getTrustedClientIp,
+  sanitizeUploadFilename,
+  validateUploadedFileBytes,
+  verifyTurnstileToken,
+  writeAuditLog,
+} from '../security';
 import { normalizeNgPhone } from '../../shared/nigeria-locations';
 import { formatNgn } from '../../shared/types';
 
@@ -23,9 +36,9 @@ export function createOrderRoutes() {
     const db = c.get('db');
     const user = c.get('user');
     const env = c.get('env');
-    const ip = c.req.header('x-forwarded-for') || 'local';
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
 
-    const rl = checkRateLimit(`checkout:${ip}`, 15, 60_000);
+    const rl = await checkPersistentRateLimit(db, `checkout:${ip}`, 15, 60_000);
     if (!rl.allowed) {
       return c.json({ error: 'Too many checkout attempts. Please wait a moment.' }, 429);
     }
@@ -67,6 +80,7 @@ export function createOrderRoutes() {
       secretKey: env.turnstileSecretKey,
       siteKey: env.turnstileSiteKey,
       remoteIp: ip,
+      db,
     });
     if (!turnstileCheck.ok) {
       return c.json({ error: turnstileCheck.error }, 400);
@@ -91,264 +105,317 @@ export function createOrderRoutes() {
     const customerEmail = (user?.email || addr.email).trim().toLowerCase();
 
     try {
-      const created = await db.transaction(async (tx) => {
-        let subtotalKobo = 0;
-        const resolvedItems: Array<{
-          orderItemId: string;
-          productId: string;
-          variantId: string;
-          productName: string;
-          variantName: string;
-          sku: string;
-          quantity: number;
-          unitPriceKobo: number;
-          costPriceKobo: number | null;
-          lineTotalKobo: number;
-          trackInventory: number;
-          prevStock: number;
-        }> = [];
-
-        for (const reqItem of parsed.data.items) {
-          const prod = await tx.get<Record<string, unknown>>(
-            `SELECT * FROM products WHERE id = ? AND status = 'active'`,
-            [reqItem.productId]
-          );
-          if (!prod) {
-            throw new Error(`Product ${reqItem.productId} is unavailable.`);
+      // Aggregate duplicate (productId, variantId) lines so stock deduction and order items align cleanly
+      const mergedReqItems: Array<{ productId: string; variantId: string; quantity: number }> = [];
+      const itemIndexMap = new Map<string, number>();
+      for (const reqItem of parsed.data.items) {
+        const key = `${reqItem.productId}::${reqItem.variantId}`;
+        const existingIdx = itemIndexMap.get(key);
+        if (existingIdx !== undefined) {
+          const nextQty = mergedReqItems[existingIdx].quantity + reqItem.quantity;
+          if (nextQty > 50) {
+            return c.json({ error: 'Maximum quantity per line item is 50.' }, 400);
           }
-          const variant = await tx.get<Record<string, unknown>>(
-            `SELECT * FROM product_variants WHERE id = ? AND product_id = ? AND is_active = 1`,
-            [reqItem.variantId, reqItem.productId]
-          );
-          if (!variant) {
-            throw new Error(`Selected variant for ${prod.name} is unavailable.`);
-          }
-
-          const trackInventory = Number(prod.track_inventory) === 1 ? 1 : 0;
-          const prevStock = Number(variant.stock_quantity || 0);
-          if (trackInventory) {
-            const dec = await tx.run(
-              `UPDATE product_variants
-               SET stock_quantity = stock_quantity - ?
-               WHERE id = ? AND stock_quantity >= ?`,
-              [reqItem.quantity, variant.id, reqItem.quantity]
-            );
-            if (dec.changes === 0) {
-              throw new Error(
-                `Insufficient stock for ${prod.name} (${variant.name}). Only ${prevStock} available.`
-              );
-            }
-          }
-
-          const unitPriceKobo = Number(
-            variant.sale_price_kobo ?? variant.price_kobo ?? prod.sale_price_kobo ?? prod.price_kobo
-          );
-          const costPriceKobo =
-            variant.cost_price_kobo !== null && variant.cost_price_kobo !== undefined
-              ? Number(variant.cost_price_kobo)
-              : prod.cost_price_kobo !== null && prod.cost_price_kobo !== undefined
-                ? Number(prod.cost_price_kobo)
-                : null;
-          const lineTotalKobo = unitPriceKobo * reqItem.quantity;
-          subtotalKobo += lineTotalKobo;
-
-          resolvedItems.push({
-            orderItemId: `oi_${randomUuid()}`,
-            productId: String(prod.id),
-            variantId: String(variant.id),
-            productName: String(prod.name),
-            variantName: String(variant.name),
-            sku: String(variant.sku),
-            quantity: reqItem.quantity,
-            unitPriceKobo,
-            costPriceKobo,
-            lineTotalKobo,
-            trackInventory,
-            prevStock,
-          });
+          mergedReqItems[existingIdx].quantity = nextQty;
+        } else {
+          itemIndexMap.set(key, mergedReqItems.length);
+          mergedReqItems.push({ ...reqItem });
         }
+      }
 
-        // Validate delivery zone from D1 rules (never invent fees)
-        const exactZone = await tx.get<Record<string, unknown>>(
-          `SELECT * FROM delivery_zones WHERE LOWER(state) = LOWER(?) AND LOWER(lga) = LOWER(?) AND is_enabled = 1 LIMIT 1`,
-          [addr.state.trim(), addr.lga.trim()]
+      let subtotalKobo = 0;
+      const resolvedItems: Array<{
+        orderItemId: string;
+        productId: string;
+        variantId: string;
+        productName: string;
+        variantName: string;
+        sku: string;
+        quantity: number;
+        unitPriceKobo: number;
+        costPriceKobo: number | null;
+        lineTotalKobo: number;
+        trackInventory: number;
+        prevStock: number;
+      }> = [];
+
+      for (const reqItem of mergedReqItems) {
+        const prod = await db.get<Record<string, unknown>>(
+          `SELECT * FROM products WHERE id = ? AND status = 'active'`,
+          [reqItem.productId]
         );
-        const stateZone =
-          exactZone ||
-          (await tx.get<Record<string, unknown>>(
-            `SELECT * FROM delivery_zones WHERE LOWER(state) = LOWER(?) AND lga = '*' AND is_enabled = 1 LIMIT 1`,
-            [addr.state.trim()]
-          ));
-
-        if (!stateZone) {
-          throw new Error(
-            `Delivery is currently unavailable for ${addr.lga}, ${addr.state}. Choose an enabled delivery location.`
-          );
+        if (!prod) {
+          return c.json({ error: `Product ${reqItem.productId} is unavailable.` }, 400);
         }
-
-        // Validate coupon server-side if provided
-        let discountKobo = 0;
-        let appliedCoupon: string | null = null;
-        if (parsed.data.couponCode && parsed.data.couponCode.trim()) {
-          const code = parsed.data.couponCode.trim().toUpperCase();
-          const coupon = await tx.get<Record<string, unknown>>(
-            `SELECT * FROM coupons WHERE UPPER(code) = ? AND is_active = 1`,
-            [code]
-          );
-          if (!coupon) throw new Error('Invalid or inactive discount code.');
-          const nowIso = new Date().toISOString();
-          if (coupon.starts_at && String(coupon.starts_at) > nowIso) {
-            throw new Error('This discount code is not active yet.');
-          }
-          if (coupon.expires_at && String(coupon.expires_at) < nowIso) {
-            throw new Error('This discount code has expired.');
-          }
-          if (coupon.max_uses !== null && Number(coupon.used_count) >= Number(coupon.max_uses)) {
-            throw new Error('This discount code has reached its usage limit.');
-          }
-          if (subtotalKobo < Number(coupon.min_spend_kobo || 0)) {
-            throw new Error('Order does not meet the minimum spend for this discount code.');
-          }
-
-          discountKobo =
-            coupon.discount_type === 'percentage'
-              ? Math.floor((subtotalKobo * Number(coupon.discount_value)) / 100)
-              : Math.min(subtotalKobo, Number(coupon.discount_value));
-          appliedCoupon = String(coupon.code);
-
-          await tx.run(`UPDATE coupons SET used_count = used_count + 1 WHERE id = ?`, [coupon.id]);
-        }
-
-        const discountedSubtotal = Math.max(0, subtotalKobo - discountKobo);
-        const freeThreshold =
-          stateZone.free_threshold_kobo !== null && stateZone.free_threshold_kobo !== undefined
-            ? Number(stateZone.free_threshold_kobo)
-            : null;
-        const deliveryFeeKobo =
-          freeThreshold !== null && discountedSubtotal >= freeThreshold
-            ? 0
-            : Number(stateZone.fee_kobo);
-
-        const totalKobo = discountedSubtotal + deliveryFeeKobo;
-        const orderId = `ord_${randomUuid()}`;
-        const orderNumber = generateOrderNumber();
-        const now = new Date().toISOString();
-
-        const maxDays = Number(stateZone.estimated_days_max || 3);
-        const estDate = new Date(Date.now() + maxDays * 86_400_000).toISOString().slice(0, 10);
-
-        const addressSnapshot = {
-          fullName: addr.fullName.trim(),
-          email: customerEmail,
-          phone: normalizeNgPhone(addr.phone.trim()),
-          state: addr.state.trim(),
-          lga: addr.lga.trim(),
-          city: addr.city.trim(),
-          streetAddress: addr.streetAddress.trim(),
-          additionalInstructions: (addr.additionalInstructions || '').trim(),
-        };
-
-        await tx.run(
-          `INSERT INTO orders (
-            order_id, order_number, customer_id, customer_name, customer_email, customer_phone,
-            delivery_address_snapshot_json, delivery_zone_id, delivery_fee_kobo, subtotal_kobo,
-            discount_kobo, total_kobo, coupon_code, order_status, payment_status, delivery_status,
-            courier_name, estimated_delivery_date, needs_attention, source, idempotency_key,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_payment', 'pending_payment', 'awaiting_fulfilment', ?, ?, 1, ?, ?, ?, ?)`,
-          [
-            orderId,
-            orderNumber,
-            user?.id ?? null,
-            addressSnapshot.fullName,
-            customerEmail,
-            addressSnapshot.phone,
-            JSON.stringify(addressSnapshot),
-            String(stateZone.id),
-            deliveryFeeKobo,
-            subtotalKobo,
-            discountKobo,
-            totalKobo,
-            appliedCoupon,
-            String(stateZone.courier_name || ''),
-            estDate,
-            parsed.data.source || 'web',
-            idempotencyKey,
-            now,
-            now,
-          ]
+        const variant = await db.get<Record<string, unknown>>(
+          `SELECT * FROM product_variants WHERE id = ? AND product_id = ? AND is_active = 1`,
+          [reqItem.variantId, reqItem.productId]
         );
+        if (!variant) {
+          return c.json({ error: `Selected variant for ${prod.name} is unavailable.` }, 400);
+        }
 
-        for (const item of resolvedItems) {
-          await tx.run(
-            `INSERT INTO order_items (
-              order_item_id, order_id, product_id, variant_id, product_name, variant_name,
-              sku, quantity, unit_price_kobo, cost_price_kobo, line_total_kobo
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              item.orderItemId,
-              orderId,
+        const trackInventory = Number(prod.track_inventory) === 1 ? 1 : 0;
+        const prevStock = Number(variant.stock_quantity || 0);
+        if (trackInventory && prevStock < reqItem.quantity) {
+          return c.json(
+            { error: `Insufficient stock for ${prod.name} (${variant.name}). Only ${prevStock} available.` },
+            400
+          );
+        }
+
+        const unitPriceKobo = Number(
+          variant.sale_price_kobo ?? variant.price_kobo ?? prod.sale_price_kobo ?? prod.price_kobo
+        );
+        const costPriceKobo =
+          variant.cost_price_kobo !== null && variant.cost_price_kobo !== undefined
+            ? Number(variant.cost_price_kobo)
+            : prod.cost_price_kobo !== null && prod.cost_price_kobo !== undefined
+              ? Number(prod.cost_price_kobo)
+              : null;
+        const lineTotalKobo = unitPriceKobo * reqItem.quantity;
+        subtotalKobo += lineTotalKobo;
+
+        resolvedItems.push({
+          orderItemId: `oi_${randomUuid()}`,
+          productId: String(prod.id),
+          variantId: String(variant.id),
+          productName: String(prod.name),
+          variantName: String(variant.name),
+          sku: String(variant.sku),
+          quantity: reqItem.quantity,
+          unitPriceKobo,
+          costPriceKobo,
+          lineTotalKobo,
+          trackInventory,
+          prevStock,
+        });
+      }
+
+      // Validate delivery zone from DB rules (never invent fees)
+      const exactZone = await db.get<Record<string, unknown>>(
+        `SELECT * FROM delivery_zones WHERE LOWER(state) = LOWER(?) AND LOWER(lga) = LOWER(?) AND is_enabled = 1 LIMIT 1`,
+        [addr.state.trim(), addr.lga.trim()]
+      );
+      const stateZone =
+        exactZone ||
+        (await db.get<Record<string, unknown>>(
+          `SELECT * FROM delivery_zones WHERE LOWER(state) = LOWER(?) AND lga = '*' AND is_enabled = 1 LIMIT 1`,
+          [addr.state.trim()]
+        ));
+
+      if (!stateZone) {
+        return c.json(
+          {
+            error: `Delivery is currently unavailable for ${addr.lga}, ${addr.state}. Choose an enabled delivery location.`,
+          },
+          400
+        );
+      }
+
+      // Pre-validate coupon server-side if provided (re-enforced atomically inside db.batch triggers)
+      let discountKobo = 0;
+      let appliedCoupon: string | null = null;
+      let appliedCouponId: string | null = null;
+      if (parsed.data.couponCode && parsed.data.couponCode.trim()) {
+        const code = parsed.data.couponCode.trim().toUpperCase();
+        const coupon = await db.get<Record<string, unknown>>(
+          `SELECT * FROM coupons WHERE UPPER(code) = ? AND is_active = 1`,
+          [code]
+        );
+        if (!coupon) return c.json({ error: 'Invalid or inactive discount code.' }, 400);
+        const nowIso = new Date().toISOString();
+        if (coupon.starts_at && String(coupon.starts_at) > nowIso) {
+          return c.json({ error: 'This discount code is not active yet.' }, 400);
+        }
+        if (coupon.expires_at && String(coupon.expires_at) < nowIso) {
+          return c.json({ error: 'This discount code has expired.' }, 400);
+        }
+        if (coupon.max_uses !== null && Number(coupon.used_count) >= Number(coupon.max_uses)) {
+          return c.json({ error: 'This discount code has reached its usage limit.' }, 400);
+        }
+        if (subtotalKobo < Number(coupon.min_spend_kobo || 0)) {
+          return c.json(
+            { error: 'Order does not meet the minimum spend for this discount code.' },
+            400
+          );
+        }
+
+        discountKobo =
+          coupon.discount_type === 'percentage'
+            ? Math.floor((subtotalKobo * Number(coupon.discount_value)) / 100)
+            : Math.min(subtotalKobo, Number(coupon.discount_value));
+        appliedCoupon = String(coupon.code);
+        appliedCouponId = String(coupon.id);
+      }
+
+      const discountedSubtotal = Math.max(0, subtotalKobo - discountKobo);
+      const freeThreshold =
+        stateZone.free_threshold_kobo !== null && stateZone.free_threshold_kobo !== undefined
+          ? Number(stateZone.free_threshold_kobo)
+          : null;
+      const deliveryFeeKobo =
+        freeThreshold !== null && discountedSubtotal >= freeThreshold
+          ? 0
+          : Number(stateZone.fee_kobo);
+
+      const totalKobo = discountedSubtotal + deliveryFeeKobo;
+      const orderId = `ord_${randomUuid()}`;
+      const orderNumber = generateOrderNumber();
+      const now = new Date().toISOString();
+
+      const maxDays = Number(stateZone.estimated_days_max || 3);
+      const estDate = new Date(Date.now() + maxDays * 86_400_000).toISOString().slice(0, 10);
+
+      const addressSnapshot = {
+        fullName: addr.fullName.trim(),
+        email: customerEmail,
+        phone: normalizeNgPhone(addr.phone.trim()),
+        state: addr.state.trim(),
+        lga: addr.lga.trim(),
+        city: addr.city.trim(),
+        streetAddress: addr.streetAddress.trim(),
+        additionalInstructions: (addr.additionalInstructions || '').trim(),
+      };
+
+      const statements: BatchStatement[] = [];
+
+      // 1. Atomic stock movements & deductions (DB triggers + CHECK + NOT NULL abort entire batch on failure)
+      for (const item of resolvedItems) {
+        if (item.trackInventory) {
+          statements.push({
+            sql: `INSERT INTO inventory_movements (
+              id, product_id, variant_id, change_amount, previous_qty, new_qty,
+              reason, reference_type, reference_id, actor_id, created_at
+            ) VALUES (
+              ?, ?, ?, ?,
+              (SELECT pv.stock_quantity FROM product_variants pv JOIN products p ON p.id = pv.product_id
+               WHERE pv.id = ? AND pv.product_id = ? AND pv.is_active = 1 AND p.status = 'active'),
+              (SELECT pv.stock_quantity - ? FROM product_variants pv JOIN products p ON p.id = pv.product_id
+               WHERE pv.id = ? AND pv.product_id = ? AND pv.is_active = 1 AND p.status = 'active'),
+              'Order Placed', 'order', ?, ?, ?
+            )`,
+            params: [
+              `mov_${randomUuid()}`,
               item.productId,
               item.variantId,
-              item.productName,
-              item.variantName,
-              item.sku,
+              -item.quantity,
+              item.variantId,
+              item.productId,
               item.quantity,
-              item.unitPriceKobo,
-              item.costPriceKobo,
-              item.lineTotalKobo,
-            ]
-          );
-          if (item.trackInventory) {
-            await tx.run(
-              `INSERT INTO inventory_movements (
-                id, product_id, variant_id, change_amount, previous_qty, new_qty,
-                reason, reference_type, reference_id, actor_id, created_at
-              ) VALUES (?, ?, ?, ?, ?, ?, 'Order Placed', 'order', ?, ?, ?)`,
-              [
-                `mov_${randomUuid()}`,
-                item.productId,
-                item.variantId,
-                -item.quantity,
-                item.prevStock,
-                item.prevStock - item.quantity,
-                orderId,
-                user?.id ?? null,
-                now,
-              ]
-            );
-          }
+              item.variantId,
+              item.productId,
+              orderId,
+              user?.id ?? null,
+              now,
+            ],
+          });
+          statements.push({
+            sql: `UPDATE product_variants
+                  SET stock_quantity = stock_quantity - ?
+                  WHERE id = ? AND is_active = 1`,
+            params: [item.quantity, item.variantId],
+          });
         }
+      }
 
-        await tx.run(
-          `INSERT INTO payments (id, order_id, method, expected_amount_kobo, status, created_at, updated_at)
-           VALUES (?, ?, 'bank_transfer', ?, 'pending_payment', ?, ?)`,
-          [`pay_${randomUuid()}`, orderId, totalKobo, now, now]
-        );
+      // 2. Atomic coupon increment (trg_coupons_validate_usage aborts batch on inactive/start/expiry/max_uses)
+      if (appliedCouponId) {
+        statements.push({
+          sql: `UPDATE coupons SET used_count = used_count + 1 WHERE id = ?`,
+          params: [appliedCouponId],
+        });
+      }
 
-        await tx.run(
-          `INSERT INTO order_status_history (
-            id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at
-          ) VALUES (?, ?, 'order', NULL, 'pending_payment', ?, ?, 'Order placed via storefront checkout. Awaiting manual bank transfer.', ?)`,
-          [`hist_${randomUuid()}`, orderId, user?.id ?? null, addressSnapshot.fullName, now]
-        );
-
-        if (user) {
-          await tx.run(`DELETE FROM carts WHERE user_id = ?`, [user.id]);
-        }
-
-        return {
+      // 3. Order creation (trg_orders_validate_checkout aborts batch if delivery zone/coupon disappeared)
+      statements.push({
+        sql: `INSERT INTO orders (
+          order_id, order_number, customer_id, customer_name, customer_email, customer_phone,
+          delivery_address_snapshot_json, delivery_zone_id, delivery_fee_kobo, subtotal_kobo,
+          discount_kobo, total_kobo, coupon_code, order_status, payment_status, delivery_status,
+          courier_name, estimated_delivery_date, needs_attention, source, idempotency_key,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_payment', 'pending_payment', 'awaiting_fulfilment', ?, ?, 1, ?, ?, ?, ?)`,
+        params: [
           orderId,
           orderNumber,
+          user?.id ?? null,
+          addressSnapshot.fullName,
+          customerEmail,
+          addressSnapshot.phone,
+          JSON.stringify(addressSnapshot),
+          String(stateZone.id),
+          deliveryFeeKobo,
           subtotalKobo,
           discountKobo,
-          deliveryFeeKobo,
           totalKobo,
-          addressSnapshot,
-          resolvedItems,
-          estimatedDeliveryDate: estDate,
-        };
+          appliedCoupon,
+          String(stateZone.courier_name || ''),
+          estDate,
+          parsed.data.source || 'web',
+          idempotencyKey,
+          now,
+          now,
+        ],
       });
+
+      // 4. Order items (trg_order_items_validate_variant aborts batch if product/variant disappeared/deactivated)
+      for (const item of resolvedItems) {
+        statements.push({
+          sql: `INSERT INTO order_items (
+            order_item_id, order_id, product_id, variant_id, product_name, variant_name,
+            sku, quantity, unit_price_kobo, cost_price_kobo, line_total_kobo
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            item.orderItemId,
+            orderId,
+            item.productId,
+            item.variantId,
+            item.productName,
+            item.variantName,
+            item.sku,
+            item.quantity,
+            item.unitPriceKobo,
+            item.costPriceKobo,
+            item.lineTotalKobo,
+          ],
+        });
+      }
+
+      // 5. Payment record, initial status history, and cart clear
+      statements.push({
+        sql: `INSERT INTO payments (id, order_id, method, expected_amount_kobo, status, created_at, updated_at)
+              VALUES (?, ?, 'bank_transfer', ?, 'pending_payment', ?, ?)`,
+        params: [`pay_${randomUuid()}`, orderId, totalKobo, now, now],
+      });
+
+      statements.push({
+        sql: `INSERT INTO order_status_history (
+          id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at
+        ) VALUES (?, ?, 'order', NULL, 'pending_payment', ?, ?, 'Order placed via storefront checkout. Awaiting manual bank transfer.', ?)`,
+        params: [`hist_${randomUuid()}`, orderId, user?.id ?? null, addressSnapshot.fullName, now],
+      });
+
+      if (user) {
+        statements.push({
+          sql: `DELETE FROM carts WHERE user_id = ?`,
+          params: [user.id],
+        });
+      }
+
+      await db.batch(statements);
+
+      const created = {
+        orderId,
+        orderNumber,
+        subtotalKobo,
+        discountKobo,
+        deliveryFeeKobo,
+        totalKobo,
+        addressSnapshot,
+        resolvedItems,
+        estimatedDeliveryDate: estDate,
+      };
 
       // Trigger customer & admin Brevo notifications asynchronously after DB commit
       triggerOrderNotifications(db, env, {
@@ -373,10 +440,63 @@ export function createOrderRoutes() {
 
       return c.json({ ok: true, ...created }, 201);
     } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Unable to complete checkout.' },
-        400
-      );
+      if (isUniqueConstraintError(err, 'idempotency_key')) {
+        const dup = await db.get<Record<string, unknown>>(
+          `SELECT order_id, order_number, total_kobo FROM orders WHERE idempotency_key = ?`,
+          [idempotencyKey]
+        );
+        if (dup) {
+          return c.json({
+            ok: true,
+            duplicate: true,
+            orderId: dup.order_id,
+            orderNumber: dup.order_number,
+            totalKobo: dup.total_kobo,
+          });
+        }
+      }
+
+      const guardCode = extractDbGuardCode(err);
+      const errMsg = err instanceof Error ? err.message : '';
+      if (guardCode === 'INSUFFICIENT_STOCK' || /stock_quantity/i.test(errMsg)) {
+        return c.json(
+          { error: 'Insufficient stock for one or more items. Please adjust your cart and retry.' },
+          400
+        );
+      }
+      if (guardCode === 'VARIANT_UNAVAILABLE' || /inventory_movements\.(previous_qty|new_qty)/i.test(errMsg)) {
+        return c.json(
+          { error: 'One or more selected products or variants are no longer available.' },
+          400
+        );
+      }
+      if (guardCode === 'DELIVERY_ZONE_UNAVAILABLE') {
+        return c.json(
+          { error: 'Delivery is currently unavailable for the selected location.' },
+          400
+        );
+      }
+      if (guardCode === 'COUPON_NOT_STARTED') {
+        return c.json({ error: 'This discount code is not active yet.' }, 400);
+      }
+      if (guardCode === 'COUPON_EXPIRED') {
+        return c.json({ error: 'This discount code has expired.' }, 400);
+      }
+      if (guardCode === 'COUPON_LIMIT_EXCEEDED') {
+        return c.json({ error: 'This discount code has reached its usage limit.' }, 400);
+      }
+      if (guardCode === 'COUPON_INACTIVE' || guardCode === 'COUPON_INVALID') {
+        return c.json({ error: 'Invalid or inactive discount code.' }, 400);
+      }
+
+      return respondWithCapturedError(c, {
+        status: 400,
+        publicMessage: 'Unable to complete checkout right now. Please try again.',
+        serviceCategory: 'checkout',
+        failedOperation: 'customer_checkout',
+        location: 'orders.ts:POST /checkout',
+        error: err,
+      });
     }
   });
 
@@ -465,8 +585,9 @@ export function createOrderRoutes() {
   app.post('/tracking/lookup', async (c) => {
     const db = c.get('db');
     const user = c.get('user');
-    const ip = c.req.header('x-forwarded-for') || 'local';
-    const rl = checkRateLimit(`track:${ip}`, 20, 60_000);
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `track:${ip}`, 20, 60_000);
     if (!rl.allowed) {
       return c.json(
         { error: `Too many tracking attempts. Please wait ${rl.retryAfterSec}s.` },
@@ -577,6 +698,14 @@ export function createOrderRoutes() {
     const storage = c.get('storage');
     const user = c.get('user');
     const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `evidence:${ip}`, 12, 60_000);
+    if (!rl.allowed) {
+      return c.json(
+        { error: `Too many upload attempts. Please wait ${rl.retryAfterSec}s.` },
+        429
+      );
+    }
     const orderNumber = c.req.param('orderNumber').trim().toUpperCase();
 
     const order = await db.get<Record<string, unknown>>(
@@ -624,6 +753,12 @@ export function createOrderRoutes() {
       return c.json({ error: 'Receipt file size must be 5MB or less.' }, 400);
     }
 
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const magicCheck = validateUploadedFileBytes(bytes, file.type, allowedMimes);
+    if (!magicCheck.ok) {
+      return c.json({ error: magicCheck.error }, 400);
+    }
+
     const existingEv = await db.get<{ id: string }>(
       `SELECT id FROM payment_evidence WHERE idempotency_key = ?`,
       [idempotencyKey]
@@ -636,66 +771,133 @@ export function createOrderRoutes() {
       `SELECT id, status FROM payments WHERE order_id = ?`,
       [order.order_id]
     );
-    if (!payment) return c.json({ error: 'Payment record missing' }, 500);
+    if (!payment) {
+      return respondWithCapturedError(c, {
+        status: 500,
+        publicMessage: 'Unable to locate payment record for this order.',
+        serviceCategory: 'payment',
+        failedOperation: 'upload_payment_evidence',
+        location: 'orders.ts:POST /payments/:orderNumber/evidence',
+        error: new Error(`Payment record missing for order ${String(order.order_id)}`),
+      });
+    }
     if (payment.status === 'payment_confirmed') {
       return c.json({ error: 'Payment for this order is already confirmed.' }, 400);
     }
 
-    const ext = file.type === 'application/pdf' ? 'pdf' : file.type.split('/')[1] || 'bin';
     const evidenceId = `pev_${randomUuid()}`;
-    const r2Key = `receipts/${order.order_id}/${evidenceId}.${ext}`;
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    await storage.put(r2Key, bytes, file.type);
+    const r2Key = `receipts/${order.order_id}/${evidenceId}.${magicCheck.extension}`;
+    const safeOriginalName = sanitizeUploadFilename(file.name, `receipt.${magicCheck.extension}`);
+    await storage.put(r2Key, bytes, magicCheck.detectedMime);
 
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `INSERT INTO payment_evidence (
-          id, payment_id, order_id, customer_id, reference_number, amount_submitted_kobo,
-          transfer_date, receipt_r2_key, receipt_mime_type, receipt_original_name, notes,
-          idempotency_key, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          evidenceId,
-          payment.id,
-          order.order_id,
-          user?.id ?? null,
-          referenceNumber,
-          amountSubmittedKobo,
-          transferDate,
-          r2Key,
-          file.type,
-          file.name,
-          notes,
-          idempotencyKey,
-          now,
-        ]
-      );
+    try {
+      await db.batch([
+        {
+          // trg_payment_evidence_block_confirmed aborts if payment is missing or already confirmed
+          sql: `INSERT INTO payment_evidence (
+            id, payment_id, order_id, customer_id, reference_number, amount_submitted_kobo,
+            transfer_date, receipt_r2_key, receipt_mime_type, receipt_original_name, notes,
+            idempotency_key, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            evidenceId,
+            payment.id,
+            order.order_id,
+            user?.id ?? null,
+            referenceNumber,
+            amountSubmittedKobo,
+            transferDate,
+            r2Key,
+            magicCheck.detectedMime,
+            safeOriginalName,
+            notes,
+            idempotencyKey,
+            now,
+          ],
+        },
+        {
+          // Uploading evidence NEVER marks an order paid — moves to Payment Under Review; trigger guards state
+          sql: `UPDATE payments SET status = 'payment_under_review', updated_at = ? WHERE id = ?`,
+          params: [now, payment.id],
+        },
+        {
+          sql: `UPDATE orders SET
+            order_status = CASE
+              WHEN order_status IN ('pending_payment', 'payment_under_review', 'payment_rejected')
+              THEN 'payment_under_review'
+              ELSE order_status
+            END,
+            payment_status = 'payment_under_review',
+            needs_attention = 1,
+            updated_at = ?
+            WHERE order_id = ?`,
+          params: [now, order.order_id],
+        },
+        {
+          sql: `INSERT INTO order_status_history (
+            id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at
+          ) VALUES (?, ?, 'payment', ?, 'payment_under_review', ?, ?, ?, ?)`,
+          params: [
+            `hist_${randomUuid()}`,
+            order.order_id,
+            payment.status,
+            user?.id ?? null,
+            String(order.customer_name),
+            `Payment evidence submitted (Ref: ${referenceNumber}, Amount: ${formatNgn(amountSubmittedKobo)})`,
+            now,
+          ],
+        },
+      ]);
+    } catch (err) {
+      // Compensating R2 cleanup so failed DB batches never leave orphaned receipts attached
+      try {
+        await storage.delete(r2Key);
+      } catch (cleanupErr) {
+        console.error('Failed to delete orphaned receipt from storage:', r2Key, cleanupErr);
+        try {
+          await db.run(
+            `INSERT OR IGNORE INTO storage_orphan_records (id, r2_key, prefix, reason, status, created_at)
+             VALUES (?, ?, 'receipts', ?, 'pending', ?)`,
+            [
+              `orp_${randomUuid()}`,
+              r2Key,
+              cleanupErr instanceof Error ? cleanupErr.message : 'delete_failed_after_db_abort',
+              new Date().toISOString(),
+            ]
+          );
+        } catch {
+          // Non-fatal if DB itself is unavailable; prefix reconciliation handles recovery
+        }
+      }
 
-      // Uploading evidence NEVER marks an order paid — it moves it to Payment Under Review
-      await tx.run(
-        `UPDATE payments SET status = 'payment_under_review', updated_at = ? WHERE id = ?`,
-        [now, payment.id]
-      );
-      await tx.run(
-        `UPDATE orders SET order_status = 'payment_under_review', payment_status = 'payment_under_review', needs_attention = 1, updated_at = ? WHERE order_id = ?`,
-        [now, order.order_id]
-      );
-      await tx.run(
-        `INSERT INTO order_status_history (
-          id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at
-        ) VALUES (?, ?, 'payment', ?, 'payment_under_review', ?, ?, ?, ?)`,
-        [
-          `hist_${randomUuid()}`,
-          order.order_id,
-          payment.status,
-          user?.id ?? null,
-          String(order.customer_name),
-          `Payment evidence submitted (Ref: ${referenceNumber}, Amount: ${formatNgn(amountSubmittedKobo)})`,
-          now,
-        ]
-      );
-    });
+      if (isUniqueConstraintError(err, 'idempotency_key')) {
+        const dup = await db.get<{ id: string }>(
+          `SELECT id FROM payment_evidence WHERE idempotency_key = ?`,
+          [idempotencyKey]
+        );
+        if (dup) {
+          return c.json({ ok: true, duplicate: true, evidenceId: dup.id });
+        }
+      }
+
+      const guardCode = extractDbGuardCode(err);
+      if (guardCode === 'PAYMENT_ALREADY_CONFIRMED') {
+        return c.json({ error: 'Payment for this order is already confirmed.' }, 400);
+      }
+      if (guardCode === 'PAYMENT_NOT_FOUND') {
+        return c.json({ error: 'Payment record missing.' }, 404);
+      }
+
+      return respondWithCapturedError(c, {
+        status: 500,
+        publicMessage: 'Unable to record payment evidence. Please try again.',
+        serviceCategory: 'payment',
+        failedOperation: 'record_payment_evidence',
+        location: 'orders.ts:POST /payments/:orderNumber/evidence',
+        error: err,
+      });
+    }
 
     await writeAuditLog(db, {
       actorId: user?.id ?? null,
@@ -762,11 +964,13 @@ export function createOrderRoutes() {
     const fileObj = await storage.get(row.receipt_r2_key);
     if (!fileObj) return c.json({ error: 'Receipt file missing from storage' }, 404);
 
+    const safeFilename = sanitizeUploadFilename(row.receipt_original_name, 'receipt');
     return new Response(new Uint8Array(fileObj.data), {
       status: 200,
       headers: {
         'Content-Type': row.receipt_mime_type || fileObj.contentType,
-        'Content-Disposition': `inline; filename="${row.receipt_original_name.replace(/"/g, '')}"`,
+        'Content-Disposition': `attachment; filename="${safeFilename}"`,
+        'Content-Security-Policy': "default-src 'none'; sandbox",
         'Cache-Control': 'private, no-store',
         'X-Content-Type-Options': 'nosniff',
       },

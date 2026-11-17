@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ArrowLeft, Heart, Minus, Plus, ShieldCheck, Star, Truck } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { apiFetch, resolveMediaUrl } from '../lib/api';
 import { syncDocumentSeo } from '../lib/seo';
 import { trackProductView } from '../lib/analytics';
 import { formatLagosDate, formatNgn } from '../shared/types';
@@ -294,7 +294,7 @@ export const ProductDetailView: React.FC<ProductDetailProps> = ({
           <div className="aspect-[4/3] w-full overflow-hidden rounded-2xl bg-white border border-slate-200">
             {media[activeImg] ? (
               <img
-                src={media[activeImg]}
+                src={resolveMediaUrl(media[activeImg])}
                 alt={product.image_alt || product.name}
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
@@ -317,7 +317,7 @@ export const ProductDetailView: React.FC<ProductDetailProps> = ({
                   }`}
                 >
                   <img
-                    src={src}
+                    src={resolveMediaUrl(src)}
                     alt={`${product.image_alt || product.name} view ${idx + 1}`}
                     className="w-full h-full object-cover"
                   />
@@ -661,7 +661,7 @@ export const ProductDetailView: React.FC<ProductDetailProps> = ({
                 <div className="aspect-[4/3] bg-[#F5F7F4] overflow-hidden">
                   {r.media?.[0] && (
                     <img
-                      src={r.media[0]}
+                      src={resolveMediaUrl(r.media[0])}
                       alt={r.name}
                       className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform"
                     />

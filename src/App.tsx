@@ -11,7 +11,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { apiFetch } from './lib/api';
+import { apiFetch, resolveMediaUrl } from './lib/api';
 import { syncDocumentSeo } from './lib/seo';
 import {
   getAnalyticsConsent,
@@ -685,7 +685,7 @@ export function App() {
           >
             {theme.logoUrl ? (
               <img
-                src={theme.logoUrl}
+                src={resolveMediaUrl(theme.logoUrl)}
                 alt={theme.storeName || 'SELLORA'}
                 className="h-8 w-auto object-contain"
               />
@@ -807,7 +807,7 @@ export function App() {
                   setSearchQuery(e.target.value);
                   if (view !== 'shop' && view !== 'home') setView('shop');
                 }}
-                placeholder="Search products, SKUs, categories..."
+                placeholder="Search products, brands, categories..."
                 className="flex-1 rounded-lg border border-slate-300 px-3.5 py-2 text-sm focus:border-[#172554] focus:outline-none"
               />
               <button
@@ -894,10 +894,10 @@ export function App() {
                   <div className="lg:col-span-7">
                     <div className="aspect-[16/9] lg:h-full w-full overflow-hidden rounded-2xl bg-[#172554] border border-slate-200">
                       <img
-                        src={
+                        src={resolveMediaUrl(
                           theme.heroImage ||
-                          '/src/assets/images/hero_sellora_editorial_1794648058731.jpg'
-                        }
+                            '/src/assets/images/hero_sellora_editorial_1794648058731.jpg'
+                        )}
                         alt="SELLORA curated studio collection"
                         referrerPolicy="no-referrer"
                         className="w-full h-full object-cover"
@@ -1003,8 +1003,7 @@ export function App() {
                 <div className="rounded-2xl bg-white border border-slate-200 p-12 text-center space-y-3">
                   <h3 className="text-base font-bold text-[#172554]">No matching products</h3>
                   <p className="text-xs text-slate-500">
-                    Try clearing your search or category filter, or add products from Admin
-                    Dashboard.
+                    Try clearing your search or category filter to explore more items.
                   </p>
                 </div>
               ) : (
@@ -1032,7 +1031,7 @@ export function App() {
                           >
                             {p.media?.[0] ? (
                               <img
-                                src={p.media[0]}
+                                src={resolveMediaUrl(p.media[0])}
                                 alt={p.image_alt || p.name}
                                 referrerPolicy="no-referrer"
                                 loading="lazy"
@@ -1415,7 +1414,7 @@ export function App() {
                     <div className="w-20 h-16 rounded-lg bg-[#F5F7F4] overflow-hidden shrink-0">
                       {item.image && (
                         <img
-                          src={item.image}
+                          src={resolveMediaUrl(item.image)}
                           alt={item.productName}
                           className="w-full h-full object-cover"
                         />
@@ -1531,7 +1530,7 @@ export function App() {
       {activeGaId && analyticsConsent === null && (
         <div className="fixed bottom-4 right-4 z-40 max-w-sm rounded-xl bg-[#172554] text-white border border-white/15 shadow-lg p-4 text-xs space-y-2.5">
           <p className="text-slate-200 leading-relaxed">
-            SELLORA uses anonymous Google Analytics 4 metrics to measure storefront performance.
+            SELLORA uses privacy-safe storefront analytics to improve shopping performance.
             Personal emails and payment receipts are never shared.
           </p>
           <div className="flex justify-end gap-2">

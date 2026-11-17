@@ -618,7 +618,7 @@ export const AdminOperationsTab: React.FC<{
                   >
                     <div className="font-bold text-[#172554] truncate">{p.name}</div>
                     <div className="text-slate-500">
-                      {v.sku} · {v.stock_quantity} left
+                      {v.name} · {v.stock_quantity} left
                     </div>
                     <div className="font-bold tabular-nums mt-1">
                       {formatNgn(v.sale_price_kobo ?? v.price_kobo)}

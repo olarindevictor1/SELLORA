@@ -1,5 +1,6 @@
 import { randomUuid } from './crypto';
 import type { SelloraDb } from './db';
+import { recordCapturedError, redactSensitiveText } from './error-monitor';
 
 export interface EmailEnvConfig {
   brevoApiKey?: string;
@@ -75,14 +76,14 @@ export async function getEffectiveEmailConfig(
     adminNotificationEmail:
       (stored.adminNotificationEmail || '').trim() ||
       env.adminNotificationEmail ||
-      'olarindevictor3@gmail.com',
+      'olarindevictor046@gmail.com',
     fromEmail: stored.fromEmail || env.brevoFromEmail || '',
     fromName: stored.fromName || env.brevoFromName || 'SELLORA',
     testEmailRecipient:
       (stored.testEmailRecipient || '').trim() ||
       (stored.adminNotificationEmail || '').trim() ||
       env.adminNotificationEmail ||
-      'olarindevictor3@gmail.com',
+      'olarindevictor046@gmail.com',
     adminEvents: { ...DEFAULT_EMAIL_SETTINGS.adminEvents, ...(stored.adminEvents || {}) },
     customerEvents: { ...DEFAULT_EMAIL_SETTINGS.customerEvents, ...(stored.customerEvents || {}) },
     hasApiKey: Boolean(env.brevoApiKey && env.brevoApiKey.trim().length > 0),
@@ -259,8 +260,8 @@ export async function dispatchSingleEmailEvent(
 
   if (!env.brevoApiKey || !config.fromEmail) {
     const errMsg = !env.brevoApiKey
-      ? 'BREVO_API_KEY is not configured in server environment.'
-      : 'Verified sender email (BREVO_FROM_EMAIL) is not configured.';
+      ? 'Notification service credentials are not configured.'
+      : 'Verified sender email address is not configured.';
     const finalStatus = nextAttempt >= event.max_attempts ? 'failed' : 'queued';
     const retryAt =
       finalStatus === 'queued'
@@ -322,7 +323,8 @@ export async function dispatchSingleEmailEvent(
       return { ok: true, status: 'accepted_by_provider', messageId: msgId || undefined };
     }
 
-    const errMsg = parsed.message || `Brevo API returned HTTP ${response.status}`;
+    const rawErrMsg = parsed.message || `Email delivery service returned HTTP ${response.status}`;
+    const errMsg = redactSensitiveText(rawErrMsg, 400);
     const isPermanent = response.status >= 400 && response.status < 500 && response.status !== 429;
     const finalStatus = isPermanent || nextAttempt >= event.max_attempts ? 'failed' : 'queued';
     const retryAt =
@@ -339,9 +341,21 @@ export async function dispatchSingleEmailEvent(
       `UPDATE email_notification_events SET status = ?, last_error = ?, next_retry_at = ?, updated_at = ? WHERE event_id = ?`,
       [finalStatus, errMsg, retryAt, now, eventId]
     );
+    await recordCapturedError(db, {
+      serviceCategory: 'email',
+      errorCategory: 'EmailProviderError',
+      failedOperation: 'dispatch_transactional_email',
+      location: 'email.ts:dispatchSingleEmailEvent',
+      error: new Error(errMsg),
+      providerErrorCode: `HTTP_${response.status}`,
+      retryAttempt: nextAttempt,
+    });
     return { ok: false, status: finalStatus, error: errMsg };
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : 'Network error calling Brevo API';
+    const errMsg = redactSensitiveText(
+      err instanceof Error ? err.message : 'Network error reaching email delivery service',
+      400
+    );
     const finalStatus = nextAttempt >= event.max_attempts ? 'failed' : 'queued';
     const retryAt =
       finalStatus === 'queued'
@@ -357,6 +371,14 @@ export async function dispatchSingleEmailEvent(
       `UPDATE email_notification_events SET status = ?, last_error = ?, next_retry_at = ?, updated_at = ? WHERE event_id = ?`,
       [finalStatus, errMsg, retryAt, now, eventId]
     );
+    await recordCapturedError(db, {
+      serviceCategory: 'email',
+      errorCategory: 'EmailTransportError',
+      failedOperation: 'dispatch_transactional_email',
+      location: 'email.ts:dispatchSingleEmailEvent',
+      error: err,
+      retryAttempt: nextAttempt,
+    });
     return { ok: false, status: finalStatus, error: errMsg };
   }
 }
@@ -397,72 +419,82 @@ export async function triggerOrderNotifications(
     uniqueSuffix?: string;
   }
 ): Promise<void> {
-  const cfg = await getEffectiveEmailConfig(db, env);
-  const trackUrl = `${cfg.resolvedAppUrl}/?view=track&order=${encodeURIComponent(params.orderNumber)}`;
-  const adminUrl = `${cfg.resolvedAppUrl}/?view=admin&tab=orders&order=${encodeURIComponent(params.orderNumber)}`;
-  const suffix = params.uniqueSuffix ? `:${params.uniqueSuffix}` : '';
+  try {
+    const cfg = await getEffectiveEmailConfig(db, env);
+    const trackUrl = `${cfg.resolvedAppUrl}/?view=track&order=${encodeURIComponent(params.orderNumber)}`;
+    const adminUrl = `${cfg.resolvedAppUrl}/?view=admin&tab=orders&order=${encodeURIComponent(params.orderNumber)}`;
+    const suffix = params.uniqueSuffix ? `:${params.uniqueSuffix}` : '';
 
-  if (cfg.customerEvents[params.eventKey] !== false) {
-    const custHtml = renderSelloraEmailHtml({
-      title: params.customerTitle,
-      greeting: `Hello ${params.customerName},`,
-      intro: params.customerIntro,
-      orderNumber: params.orderNumber,
-      statusLabel: params.statusLabel,
-      detailsRows: [
-        { label: 'Order Total', value: params.totalFormatted },
-        ...(params.deliveryLocation ? [{ label: 'Delivery Location', value: params.deliveryLocation }] : []),
-        ...(params.extraRows || []),
-      ],
-      ctaLabel: 'Track Your Order',
-      ctaUrl: trackUrl,
-    });
-    const res = await queueEmailEvent(db, {
-      idempotencyKey: `cust:${params.eventKey}:${params.orderId}:${params.statusLabel}${suffix}`,
-      orderId: params.orderId,
-      orderNumber: params.orderNumber,
-      recipientEmail: params.customerEmail,
-      recipientType: 'customer',
-      notificationType: params.eventKey,
-      subject: `[SELLORA] ${params.customerTitle} — ${params.orderNumber}`,
-      htmlBody: custHtml,
-    });
-    if (res.queued && res.eventId) {
-      await dispatchSingleEmailEvent(db, env, res.eventId);
+    if (cfg.customerEvents[params.eventKey] !== false) {
+      const custHtml = renderSelloraEmailHtml({
+        title: params.customerTitle,
+        greeting: `Hello ${params.customerName},`,
+        intro: params.customerIntro,
+        orderNumber: params.orderNumber,
+        statusLabel: params.statusLabel,
+        detailsRows: [
+          { label: 'Order Total', value: params.totalFormatted },
+          ...(params.deliveryLocation ? [{ label: 'Delivery Location', value: params.deliveryLocation }] : []),
+          ...(params.extraRows || []),
+        ],
+        ctaLabel: 'Track Your Order',
+        ctaUrl: trackUrl,
+      });
+      const res = await queueEmailEvent(db, {
+        idempotencyKey: `cust:${params.eventKey}:${params.orderId}:${params.statusLabel}${suffix}`,
+        orderId: params.orderId,
+        orderNumber: params.orderNumber,
+        recipientEmail: params.customerEmail,
+        recipientType: 'customer',
+        notificationType: params.eventKey,
+        subject: `[SELLORA] ${params.customerTitle} — ${params.orderNumber}`,
+        htmlBody: custHtml,
+      });
+      if (res.queued && res.eventId) {
+        await dispatchSingleEmailEvent(db, env, res.eventId).catch(() => {});
+      }
     }
-  }
 
-  if (cfg.adminNotificationEmail && cfg.adminEvents[params.eventKey] !== false) {
-    const adminHtml = renderSelloraEmailHtml({
-      title: params.adminTitle,
-      greeting: 'Store Administration Notice,',
-      intro: params.adminIntro,
-      orderNumber: params.orderNumber,
-      statusLabel: params.statusLabel,
-      detailsRows: [
-        { label: 'Internal Order ID', value: params.orderId },
-        { label: 'Customer', value: `${params.customerName} (${params.customerEmail})` },
-        { label: 'Order Total', value: params.totalFormatted },
-        ...(params.deliveryLocation ? [{ label: 'Delivery Location', value: params.deliveryLocation }] : []),
-        ...(params.extraRows || []),
-      ],
-      ctaLabel: 'Open Order in Admin',
-      ctaUrl: adminUrl,
-      footerNote: 'Automated administrative notification from SELLORA.',
-    });
-    const res = await queueEmailEvent(db, {
-      idempotencyKey: `adm:${params.eventKey}:${params.orderId}:${params.statusLabel}${suffix}`,
-      orderId: params.orderId,
-      orderNumber: params.orderNumber,
-      recipientEmail: cfg.adminNotificationEmail,
-      recipientType: 'admin',
-      notificationType: params.eventKey,
-      subject: `[SELLORA Admin] ${params.adminTitle} — ${params.orderNumber}`,
-      htmlBody: adminHtml,
-    });
-    if (res.queued && res.eventId) {
-      await dispatchSingleEmailEvent(db, env, res.eventId);
+    if (cfg.adminNotificationEmail && cfg.adminEvents[params.eventKey] !== false) {
+      const adminHtml = renderSelloraEmailHtml({
+        title: params.adminTitle,
+        greeting: 'Store Administration Notice,',
+        intro: params.adminIntro,
+        orderNumber: params.orderNumber,
+        statusLabel: params.statusLabel,
+        detailsRows: [
+          { label: 'Order Reference', value: params.orderNumber },
+          { label: 'Customer', value: `${params.customerName} (${params.customerEmail})` },
+          { label: 'Order Total', value: params.totalFormatted },
+          ...(params.deliveryLocation ? [{ label: 'Delivery Location', value: params.deliveryLocation }] : []),
+          ...(params.extraRows || []),
+        ],
+        ctaLabel: 'Open Order in Admin',
+        ctaUrl: adminUrl,
+        footerNote: 'Automated administrative notification from SELLORA.',
+      });
+      const res = await queueEmailEvent(db, {
+        idempotencyKey: `adm:${params.eventKey}:${params.orderId}:${params.statusLabel}${suffix}`,
+        orderId: params.orderId,
+        orderNumber: params.orderNumber,
+        recipientEmail: cfg.adminNotificationEmail,
+        recipientType: 'admin',
+        notificationType: params.eventKey,
+        subject: `[SELLORA Admin] ${params.adminTitle} — ${params.orderNumber}`,
+        htmlBody: adminHtml,
+      });
+      if (res.queued && res.eventId) {
+        await dispatchSingleEmailEvent(db, env, res.eventId).catch(() => {});
+      }
     }
+  } catch (err) {
+    // Notification queue/dispatch failures must never fail confirmed business transactions
+    await recordCapturedError(db, {
+      serviceCategory: 'email',
+      failedOperation: `trigger_order_notifications:${params.eventKey}`,
+      location: 'email.ts:triggerOrderNotifications',
+      error: err,
+    }).catch(() => {});
   }
 }
 

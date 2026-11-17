@@ -13,6 +13,12 @@ export interface AppEnvConfig extends EmailEnvConfig {
   gaMeasurementId?: string;
   brevoWebhookSecret?: string;
   geminiApiKey?: string;
+  runtime?: 'worker' | 'node';
+  environment?: string;
+  trustedProxy?: boolean;
+  loginMaxLockoutSeconds?: number;
+  corsAllowedOrigins?: string[];
+  onFallbackLog?: (entry: Record<string, unknown>) => void;
 }
 
 export type AppContext = {

@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomUuid } from '../crypto';
 import type { AppContext } from '../context';
-import { writeAuditLog } from '../security';
+import type { BatchStatement } from '../db';
+import { checkPersistentRateLimit, getTrustedClientIp, writeAuditLog } from '../security';
 
 export function createCustomerRoutes() {
   const app = new Hono<AppContext>();
@@ -43,20 +44,43 @@ export function createCustomerRoutes() {
     const now = new Date().toISOString();
     const addressId = `addr_${randomUuid()}`;
 
-    await db.transaction(async (tx) => {
-      const existingCount = await tx.get<{ cnt: number }>(
-        `SELECT COUNT(*) as cnt FROM addresses WHERE customer_id = ?`,
-        [user.id]
-      );
-      const shouldBeDefault = parsed.data.isDefault || (existingCount?.cnt ?? 0) === 0;
-      if (shouldBeDefault) {
-        await tx.run(`UPDATE addresses SET is_default = 0 WHERE customer_id = ?`, [user.id]);
-      }
-      await tx.run(
+    if (parsed.data.isDefault === true) {
+      await db.batch([
+        {
+          sql: `UPDATE addresses SET is_default = 0 WHERE customer_id = ?`,
+          params: [user.id],
+        },
+        {
+          sql: `INSERT INTO addresses (
+            address_id, customer_id, full_name, email, phone, state, lga, city,
+            street_address, additional_instructions, is_default, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+          params: [
+            addressId,
+            user.id,
+            parsed.data.fullName.trim(),
+            parsed.data.email.trim().toLowerCase(),
+            parsed.data.phone.trim(),
+            parsed.data.state.trim(),
+            parsed.data.lga.trim(),
+            parsed.data.city.trim(),
+            parsed.data.streetAddress.trim(),
+            (parsed.data.additionalInstructions || '').trim(),
+            now,
+            now,
+          ],
+        },
+      ]);
+    } else {
+      await db.run(
         `INSERT INTO addresses (
           address_id, customer_id, full_name, email, phone, state, lga, city,
           street_address, additional_instructions, is_default, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          CASE WHEN NOT EXISTS (SELECT 1 FROM addresses WHERE customer_id = ? AND is_default = 1) THEN 1 ELSE 0 END,
+          ?, ?
+        )`,
         [
           addressId,
           user.id,
@@ -68,12 +92,12 @@ export function createCustomerRoutes() {
           parsed.data.city.trim(),
           parsed.data.streetAddress.trim(),
           (parsed.data.additionalInstructions || '').trim(),
-          shouldBeDefault ? 1 : 0,
+          user.id,
           now,
           now,
         ]
       );
-    });
+    }
 
     return c.json({ ok: true, addressId }, 201);
   });
@@ -107,39 +131,47 @@ export function createCustomerRoutes() {
       return c.json({ error: parsed.error.issues[0]?.message || 'Invalid address update' }, 400);
     }
 
-    await db.transaction(async (tx) => {
-      if (parsed.data.isDefault) {
-        await tx.run(`UPDATE addresses SET is_default = 0 WHERE customer_id = ?`, [user.id]);
-      }
-      await tx.run(
-        `UPDATE addresses SET
-          full_name = COALESCE(?, full_name),
-          email = COALESCE(?, email),
-          phone = COALESCE(?, phone),
-          state = COALESCE(?, state),
-          lga = COALESCE(?, lga),
-          city = COALESCE(?, city),
-          street_address = COALESCE(?, street_address),
-          additional_instructions = COALESCE(?, additional_instructions),
-          is_default = COALESCE(?, is_default),
-          updated_at = ?
-        WHERE address_id = ? AND customer_id = ?`,
-        [
-          parsed.data.fullName ?? null,
-          parsed.data.email ?? null,
-          parsed.data.phone ?? null,
-          parsed.data.state ?? null,
-          parsed.data.lga ?? null,
-          parsed.data.city ?? null,
-          parsed.data.streetAddress ?? null,
-          parsed.data.additionalInstructions ?? null,
-          parsed.data.isDefault !== undefined ? (parsed.data.isDefault ? 1 : 0) : null,
-          new Date().toISOString(),
-          addressId,
-          user.id,
-        ]
-      );
+    const statements: BatchStatement[] = [];
+    if (parsed.data.isDefault) {
+      // Only clear previous default if the target address still exists for this customer
+      statements.push({
+        sql: `UPDATE addresses SET is_default = 0 WHERE customer_id = ? AND EXISTS (SELECT 1 FROM addresses WHERE address_id = ? AND customer_id = ?)`,
+        params: [user.id, addressId, user.id],
+      });
+    }
+    statements.push({
+      sql: `UPDATE addresses SET
+        full_name = COALESCE(?, full_name),
+        email = COALESCE(?, email),
+        phone = COALESCE(?, phone),
+        state = COALESCE(?, state),
+        lga = COALESCE(?, lga),
+        city = COALESCE(?, city),
+        street_address = COALESCE(?, street_address),
+        additional_instructions = COALESCE(?, additional_instructions),
+        is_default = COALESCE(?, is_default),
+        updated_at = ?
+      WHERE address_id = ? AND customer_id = ?`,
+      params: [
+        parsed.data.fullName ?? null,
+        parsed.data.email ?? null,
+        parsed.data.phone ?? null,
+        parsed.data.state ?? null,
+        parsed.data.lga ?? null,
+        parsed.data.city ?? null,
+        parsed.data.streetAddress ?? null,
+        parsed.data.additionalInstructions ?? null,
+        parsed.data.isDefault !== undefined ? (parsed.data.isDefault ? 1 : 0) : null,
+        new Date().toISOString(),
+        addressId,
+        user.id,
+      ],
     });
+
+    const results = await db.batch(statements);
+    if (results[results.length - 1].changes === 0) {
+      return c.json({ error: 'Address not found' }, 404);
+    }
 
     return c.json({ ok: true });
   });
@@ -294,6 +326,13 @@ export function createCustomerRoutes() {
 
   app.post('/support', async (c) => {
     const user = c.get('user');
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `support:${user?.id || ip}`, 10, 60_000);
+    if (!rl.allowed) {
+      return c.json({ error: 'Too many support requests. Please wait a moment.' }, 429);
+    }
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
       customerName: z.string().min(2).max(120).optional(),
@@ -311,7 +350,6 @@ export function createCustomerRoutes() {
     const email = user?.email || parsed.data.customerEmail;
     if (!name || !email) return c.json({ error: 'Name and email are required.' }, 400);
 
-    const db = c.get('db');
     const now = new Date().toISOString();
     const id = `tkt_${randomUuid()}`;
     await db.run(

@@ -68,7 +68,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     { id: 'marketing', label: 'Marketing', icon: Tag, perm: 'marketing:write' },
     { id: 'pos', label: 'Point of Sale', icon: Store, perm: 'pos:use' },
     { id: 'theme', label: 'Theme & CMS', icon: LayoutTemplate, perm: 'settings:write' },
-    { id: 'email', label: 'Email & History', icon: Mail, perm: 'email:manage' },
+    { id: 'email', label: 'Order Notifications', icon: Mail, perm: 'email:manage' },
     { id: 'settings', label: 'Settings & Staff', icon: Settings, perm: 'settings:write' },
   ];
   const navItems = allNavItems.filter((item) => !item.perm || perms.has(item.perm));
@@ -143,8 +143,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           {currentTab === 'analytics' && <AdminAnalyticsTab />}
           {currentTab === 'orders' && <AdminOrdersTab />}
           {currentTab === 'payments' && <AdminPaymentsTab />}
-          {currentTab === 'products' && <AdminCatalogTab key="prod" initialSubTab="products" />}
-          {currentTab === 'inventory' && <AdminCatalogTab key="inv" initialSubTab="inventory" />}
+          {currentTab === 'products' && <AdminCatalogTab key="prod" initialSubTab="products" user={user} />}
+          {currentTab === 'inventory' && <AdminCatalogTab key="inv" initialSubTab="inventory" user={user} />}
           {currentTab === 'customers' && <AdminOperationsTab key="cust" mode="customers" />}
           {currentTab === 'delivery' && <AdminOperationsTab key="del" mode="delivery" />}
           {currentTab === 'marketing' && <AdminOperationsTab key="mkt" mode="marketing" />}
@@ -154,6 +154,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               key="theme"
               mode="theme"
               capabilities={capabilities}
+              user={user}
               onRefreshStorefront={onRefreshStorefront}
             />
           )}
@@ -162,6 +163,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               key="email"
               mode="email"
               capabilities={capabilities}
+              user={user}
               onRefreshStorefront={onRefreshStorefront}
             />
           )}
@@ -170,6 +172,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               key="settings"
               mode="settings"
               capabilities={capabilities}
+              user={user}
               onRefreshStorefront={onRefreshStorefront}
             />
           )}

@@ -1,4 +1,5 @@
 name = "sellora-commerce"
+account_id = "af9c25c7647f2f2c551eab70be86b074"
 main = "worker/index.ts"
 compatibility_date = "2026-03-01"
 compatibility_flags = ["nodejs_compat"]
@@ -40,9 +41,12 @@ bucket_name = "sellora-media-private"
 [vars]
 # Leave APP_URL empty to auto-detect the live Worker hostname (or set your custom domain e.g. "https://shop.yourdomain.com")
 APP_URL = ""
-OWNER_EMAIL = "olarindevictor3@gmail.com"
-ADMIN_NOTIFICATION_EMAIL = "olarindevictor3@gmail.com"
+OWNER_EMAIL = "olarindevictor046@gmail.com"
+ADMIN_NOTIFICATION_EMAIL = "olarindevictor046@gmail.com"
 BREVO_FROM_NAME = "SELLORA"
+LOGIN_MAX_LOCKOUT_SECONDS = "3600"
+# Optional comma-separated extra web origins if hosting a separate frontend (Capacitor native origins are already allowed)
+CORS_ALLOWED_ORIGINS = ""
 # Optional integrations (safe to leave empty during initial deployment; disabled gracefully until configured)
 GOOGLE_SITE_VERIFICATION = ""
 VITE_GA_MEASUREMENT_ID = ""

@@ -1,9 +1,10 @@
 # SELLORA — Cloudflare Deployment, Backup & Operations Guide
 
-## 1. Free-Tier Architecture Notes
-- **Cloudflare Workers & Static Assets**: Hosts the frontend (`dist/`) and API (`worker/index.ts`).
-- **Cloudflare D1**: Relational SQLite database (`sellora-db`) using integer NGN kobo pricing and `migrations/0001_initial.sql`.
-- **Cloudflare R2**: Private storage for payment receipts (`receipts/`) and product media (`products/`). Note: R2 requires a Cloudflare account with R2 enabled (free tier includes 10 GB-month storage; verify current Cloudflare free-tier limits before enabling).
+## 1. Cloudflare-Native Production Architecture
+- **Cloudflare Workers & Static Assets (`sellora-commerce`)**: Hosts the frontend (`dist/`) and full Hono API (`worker/index.ts`) under Cloudflare account `af9c25c7647f2f2c551eab70be86b074`.
+- **Cloudflare D1 (`sellora-db`)**: Authoritative production relational database (`database_id = "a6738474-f10d-4210-b8fe-194fab0e3bd8"`) using integer NGN kobo pricing and `migrations/*.sql`.
+- **Cloudflare R2 (`sellora-media-private`)**: Authoritative private object storage for payment receipts (`receipts/<orderId>/...`) and product media (`products/prod_<uuid>.<ext>`), accessed exclusively through authenticated/scoped Worker routes (`env.R2_MEDIA`).
+- **Local Development Separation**: `server.ts` + `./.data/sellora.db` (`better-sqlite3`) + `./.data/r2` are strictly for local development/preview and refuse to boot with `NODE_ENV=production`.
 - **Brevo Transactional Email**: Free tier provides 300 emails/day via `POST https://api.brevo.com/v3/smtp/email`.
 - **Cloudflare Turnstile**: Free bot protection for checkout/auth forms.
 
@@ -19,8 +20,11 @@ wrangler secret put BREVO_API_KEY
 wrangler secret put BREVO_FROM_EMAIL
 wrangler secret put TURNSTILE_SECRET_KEY
 ```
+`OWNER_EMAIL` and `ADMIN_NOTIFICATION_EMAIL` both default to `olarindevictor046@gmail.com` in `wrangler.toml` (keep `BREVO_FROM_EMAIL` set to your verified transactional sender identity).
 
 Optional build/public configuration:
+- `VITE_API_BASE_URL`: Leave empty for same-origin Cloudflare Worker web deployment; set to your live Worker HTTPS origin (e.g. `https://sellora-commerce.<subdomain>.workers.dev`) when building standalone Android/iOS Capacitor bundles so mobile apps share the exact same D1/R2 backend.
+- `CORS_ALLOWED_ORIGINS`: Optional comma-separated extra web origins (Capacitor `capacitor://localhost`, `ionic://localhost`, `https://localhost`, `http://localhost` are already allowed).
 - `VITE_TURNSTILE_SITE_KEY`: Public Turnstile widget site key (required only when `TURNSTILE_SECRET_KEY` is active).
 - `VITE_GA_MEASUREMENT_ID`: Optional GA4 measurement ID (fallback if not saved in Admin → Settings).
 - `GOOGLE_SITE_VERIFICATION`: Optional Search Console HTML meta token (can also be saved in Admin → Settings → SEO).
@@ -45,11 +49,21 @@ npm run cf:migrate:local
 npm run cf:migrate:remote
 ```
 
-## 5. Build & Deploy to Cloudflare Workers (`sellora-commerce`)
+## 5. Build, Verify & Deploy to Cloudflare Workers (`sellora-commerce`)
 ```bash
 npm install
 npm run build
 npx wrangler deploy
+```
+After deployment, verify live readiness and D1/R2 connectivity:
+```bash
+# Public liveness (does not expose provider strings)
+curl -sS https://<your-worker-domain>/api/health
+
+# Owner-authenticated runtime proof (after signing in as owner)
+curl -sS -H "Cookie: sellora.session_token=<OWNER_SESSION>" https://<your-worker-domain>/api/admin/infrastructure-status
+# Expected:
+# {"ok":true,"runtime":"cloudflare-worker","environment":"production","database":"cloudflare-d1","storage":"cloudflare-r2",...}
 ```
 Or connect GitHub (`olarindevictor1/SELLORA`, branch `main`) directly inside **Cloudflare Dashboard → Workers & Pages → Create → Import a repository**:
 - **Build command**: `npm run build`
@@ -58,14 +72,23 @@ Or connect GitHub (`olarindevictor1/SELLORA`, branch `main`) directly inside **C
 
 > Note: Cloudflare Dashboard's drag-and-drop ZIP uploader only deploys static files (`dist/`) and does not execute `worker/index.ts`, D1, or R2 bindings. Use either **Cloudflare Workers Git Integration** (`olarindevictor1/SELLORA`) or **Wrangler CLI** (`npm run cf:deploy`) to launch the full-stack SELLORA platform.
 
+### Mobile (Android & iOS Capacitor) Shared Production API Build
+```bash
+VITE_API_BASE_URL="https://<your-worker-domain>" npm run build
+npx cap sync android
+npx cap sync ios
+```
+This routes Web, Android, and iOS clients to the exact same Cloudflare Worker API, D1 database (`sellora-db`), and R2 bucket (`sellora-media-private`).
+
 ## 6. Store Owner Authentication & Provisioning (No Manual Bootstrap Secret)
-The authorized owner (`OWNER_EMAIL`, default `olarindevictor3@gmail.com`) signs in through the standard **Sign In** dialog using either **Continue with Google** or **Email & Password** — both resolve to the same `user` account when `trustedProviders: ['google']` is enabled:
+The authorized owner (`OWNER_EMAIL`, default `olarindevictor046@gmail.com`) signs in through the standard **Sign In** dialog using either **Continue with Google** or **Email & Password** — both resolve to the same `user` account when `trustedProviders: ['google']` is enabled:
 1. **Google OAuth Sign-In**: When Google returns a verified identity (`emailVerified = true`) matching `OWNER_EMAIL`, Better Auth automatically authorizes and links the `owner` account on the server.
 2. **Email & Password Provisioning (Server CLI Only)**: To pre-provision an initial owner password before first login without exposing any claim secret in the UI:
-   - Local SQLite: `npm run owner:provision -- --email olarindevictor3@gmail.com`
+   - Local SQLite: `npm run owner:provision -- --email olarindevictor046@gmail.com`
    - Production Cloudflare D1: generate safe idempotent SQL with `npm run owner:provision -- --d1-sql > owner.sql` and execute `npx wrangler d1 execute sellora-db --remote --file=owner.sql` (then delete `owner.sql`).
-3. **Password Reset**: If the owner first signed in via Google and wants to add or reset a password, use **Forgot password?** on the Sign-In modal; Better Auth sends a signed reset token via Brevo.
-4. **Security Guardrails**: Public email/password self-registration for `OWNER_EMAIL` is blocked (`403`). Customer registrations default strictly to `role = 'customer'` and never elevate on email/password signup.
+3. **Verified Email Migration**: Existing owners changing their login email use **Admin → Settings → Owner & Staff → Change Administrator Login Email (Verified)** (`POST /api/admin/owner/change-email`), preserving `user.id`, permissions, and order history while unlinking stale Google OAuth links upon verification.
+4. **Password Reset**: If the owner first signed in via Google and wants to add or reset a password, use **Forgot password?** on the Sign-In modal; Better Auth sends a signed reset token via Brevo and clears any active login lockout upon completion.
+5. **Security Guardrails**: Public email/password self-registration for `OWNER_EMAIL` is blocked (`403`). Customer registrations default strictly to `role = 'customer'` and never elevate on email/password signup.
 
 ## 7. Manual Free-Tier Backup & Recovery
 Under free-tier D1 configuration without automated paid snapshots:

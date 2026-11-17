@@ -9,7 +9,12 @@ import {
   renderSelloraEmailHtml,
   type EmailEnvConfig,
 } from './email';
-import { writeAuditLog } from './security';
+import {
+  clearLoginThrottle,
+  extractSessionTokenFromHeaders,
+  recordSecurityEvent,
+  writeAuditLog,
+} from './security';
 import { ROLE_DEFAULT_PERMISSIONS, type Permission, type StaffRole } from '../shared/types';
 
 export interface AuthUserSession {
@@ -34,8 +39,9 @@ export function createSelloraAuth(params: {
   ownerEmail?: string;
   googleClientId?: string;
   googleClientSecret?: string;
+  corsAllowedOrigins?: string[];
 }) {
-  const authorizedOwnerEmail = (params.ownerEmail || 'olarindevictor3@gmail.com')
+  const authorizedOwnerEmail = (params.ownerEmail || 'olarindevictor046@gmail.com')
     .trim()
     .toLowerCase();
   const socialProviders: Record<
@@ -72,9 +78,17 @@ export function createSelloraAuth(params: {
         'http://localhost:3000',
         'http://127.0.0.1:3000',
         'capacitor://localhost',
+        'ionic://localhost',
         'http://localhost',
         'https://localhost',
       ]);
+      for (const extra of params.corsAllowedOrigins || []) {
+        try {
+          allowed.add(new URL(extra).origin);
+        } catch {
+          // ignore malformed origin
+        }
+      }
       if (request) {
         const host =
           request.headers.get('x-forwarded-host') || request.headers.get('host') || '';
@@ -134,6 +148,17 @@ export function createSelloraAuth(params: {
           await dispatchSingleEmailEvent(params.db, params.emailEnv, queued.eventId);
         }
       },
+      async onPasswordReset({ user }) {
+        await clearLoginThrottle(params.db, user.email, '');
+        await recordSecurityEvent(params.db, {
+          userId: user.id,
+          email: user.email,
+          eventCategory: 'password_reset_completed',
+          severity: (user as { role?: string }).role === 'owner' ? 'high' : 'medium',
+          riskLevel: 'low',
+          status: 'resolved',
+        });
+      },
     },
     emailVerification: {
       async sendVerificationEmail({ user, url }) {
@@ -157,9 +182,118 @@ export function createSelloraAuth(params: {
           await dispatchSingleEmailEvent(params.db, params.emailEnv, queued.eventId);
         }
       },
+      async afterEmailVerification(updatedUser, request) {
+        try {
+          const userRow = await params.db.get<{
+            id: string;
+            email: string;
+            name: string;
+            role: string;
+          }>(`SELECT id, email, name, role FROM user WHERE id = ?`, [updatedUser.id]);
+          if (!userRow || userRow.role !== 'owner') return;
+
+          // Clear stale Google OAuth links so the previous email's Google identity can no longer authenticate into the owner account.
+          await params.db.run(
+            `DELETE FROM account WHERE userId = ? AND providerId = 'google'`,
+            [userRow.id]
+          );
+
+          const currentToken = request ? extractSessionTokenFromHeaders(request.headers) : null;
+          if (currentToken) {
+            await params.db.run(
+              `DELETE FROM session WHERE userId = ? AND token != ?`,
+              [userRow.id, currentToken]
+            );
+          } else {
+            await params.db.run(`DELETE FROM session WHERE userId = ?`, [userRow.id]);
+          }
+
+          await writeAuditLog(params.db, {
+            actorId: userRow.id,
+            actorEmail: userRow.email,
+            actorRole: 'owner',
+            action: 'OWNER_EMAIL_CHANGED',
+            targetType: 'user',
+            targetId: userRow.id,
+            details: {
+              newEmail: userRow.email,
+              oauthUnlinked: true,
+              otherSessionsRevoked: true,
+            },
+          });
+
+          await recordSecurityEvent(params.db, {
+            userId: userRow.id,
+            email: userRow.email,
+            eventCategory: 'owner_email_changed',
+            severity: 'high',
+            riskLevel: 'low',
+            status: 'resolved',
+            metadata: {
+              userId: userRow.id,
+              newEmail: userRow.email,
+              googleLinkCleared: true,
+            },
+          });
+
+          const cfg = await getEffectiveEmailConfig(params.db, params.emailEnv);
+          if (cfg.adminNotificationEmail) {
+            const html = renderSelloraEmailHtml({
+              title: 'Administrator Login Email Updated',
+              greeting: 'Store Administration Notice,',
+              intro: `The primary store owner login email has been verified and updated to ${userRow.email}. Previous external sign-in links have been cleared for security.`,
+              detailsRows: [
+                { label: 'Account ID', value: userRow.id },
+                { label: 'Verified Login Email', value: userRow.email },
+              ],
+              footerNote:
+                'If this change was unauthorized, review active sessions and reset your password immediately.',
+            });
+            const queued = await queueEmailEvent(params.db, {
+              idempotencyKey: `owner_email_changed:${userRow.id}:${userRow.email}:${Date.now()}`,
+              recipientEmail: cfg.adminNotificationEmail,
+              recipientType: 'admin',
+              notificationType: 'security_owner_email_changed',
+              subject: '[SELLORA Security] Store Owner Login Email Updated',
+              htmlBody: html,
+            });
+            if (queued.queued && queued.eventId) {
+              await dispatchSingleEmailEvent(params.db, params.emailEnv, queued.eventId).catch(() => {});
+            }
+          }
+        } catch {
+          // Never abort verification response if post-verification cleanup fails
+        }
+      },
     },
     socialProviders,
     user: {
+      changeEmail: {
+        enabled: true,
+        updateEmailWithoutVerification: false,
+        async sendChangeEmailConfirmation({ user, newEmail, url }) {
+          const html = renderSelloraEmailHtml({
+            title: 'Confirm Your Login Email Change',
+            greeting: `Hello ${user.name || 'Store User'},`,
+            intro: `We received a request to change your SELLORA login email from ${user.email} to ${newEmail}. Confirm this step first so we can send verification to your new email address.`,
+            ctaLabel: 'Confirm Email Change Request',
+            ctaUrl: url,
+            footerNote:
+              'If you did not request this email change, ignore this message and review your active sessions immediately.',
+          });
+          const queued = await queueEmailEvent(params.db, {
+            idempotencyKey: `change_email_confirm:${user.id}:${randomUuid()}`,
+            recipientEmail: user.email,
+            recipientType: (user as { role?: string }).role === 'owner' ? 'admin' : 'customer',
+            notificationType: 'auth_change_email_confirmation',
+            subject: '[SELLORA Security] Confirm Login Email Change Request',
+            htmlBody: html,
+          });
+          if (queued.eventId) {
+            await dispatchSingleEmailEvent(params.db, params.emailEnv, queued.eventId);
+          }
+        },
+      },
       additionalFields: {
         role: {
           type: 'string',
@@ -199,6 +333,17 @@ export function createSelloraAuth(params: {
       user: {
         create: {
           before: async (user) => {
+            const emailNorm = String(user.email || '').trim().toLowerCase();
+            if (authorizedOwnerEmail && emailNorm === authorizedOwnerEmail) {
+              const existingOwner = await params.db.get<{ id: string }>(
+                `SELECT id FROM user WHERE role = 'owner' LIMIT 1`
+              );
+              if (existingOwner) {
+                throw new APIError('FORBIDDEN', {
+                  message: 'This email is reserved for the store owner account.',
+                });
+              }
+            }
             // Unconditionally force ordinary registrations (email & OAuth) to customer
             return {
               data: {
@@ -339,6 +484,19 @@ export function createSelloraAuth(params: {
                 targetId: userRow.id,
                 details: { method: 'google_oauth', providerId: 'google' },
               });
+            }
+          },
+        },
+        update: {
+          after: async (account) => {
+            if (account.providerId === 'credential' && account.password) {
+              const u = await params.db.get<{ email: string }>(
+                `SELECT email FROM user WHERE id = ?`,
+                [account.userId]
+              );
+              if (u?.email) {
+                await clearLoginThrottle(params.db, u.email, '');
+              }
             }
           },
         },

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Download, Heart, LogOut, MapPin, Package, Plus, Trash2, User } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { Download, Heart, Laptop, LogOut, MapPin, Package, Plus, ShieldCheck, Trash2, User } from 'lucide-react';
+import { apiFetch, resolveMediaUrl } from '../lib/api';
 import { trackConfirmedPurchase } from '../lib/analytics';
 import { formatLagosDate, formatNgn, ORDER_STATUS_LABELS, type OrderStatus } from '../shared/types';
 import { NigerianAddressForm, type NigerianAddressInput } from './NigerianAddressForm';
@@ -58,6 +58,10 @@ export const CustomerAccountView: React.FC<CustomerAccountProps> = ({
   const [cancelOrderNum, setCancelOrderNum] = useState<string | null>(null);
   const [cancelReason, setCancelReason] = useState('');
 
+  // Self-service active sessions & recent login activity
+  const [activeSessions, setActiveSessions] = useState<any[]>([]);
+  const [recentLogins, setRecentLogins] = useState<any[]>([]);
+
   const loadData = async () => {
     try {
       const [ordRes, addrRes, wishRes, supRes] = await Promise.all([
@@ -80,6 +84,11 @@ export const CustomerAccountView: React.FC<CustomerAccountProps> = ({
       setAddresses(addrRes.addresses || []);
       setWishlist(wishRes.items || []);
       setTickets(supRes.tickets || []);
+      const sessRes = await apiFetch<{ sessions: any[]; recentLogins: any[] }>('/api/me/sessions').catch(
+        () => ({ sessions: [], recentLogins: [] })
+      );
+      setActiveSessions(sessRes.sessions || []);
+      setRecentLogins(sessRes.recentLogins || []);
     } catch {
       // ignore
     }
@@ -206,6 +215,36 @@ export const CustomerAccountView: React.FC<CustomerAccountProps> = ({
       body: JSON.stringify({ requestType: 'deletion', notes: 'Customer requested account deletion.' }),
     });
     setMsg('Account deletion request recorded for administrator processing.');
+  };
+
+  const revokeSingleSession = async (sessionId: string) => {
+    setErr(null);
+    setMsg(null);
+    try {
+      await apiFetch(`/api/me/sessions/${sessionId}`, { method: 'DELETE' });
+      setMsg('Selected device session has been signed out.');
+      await loadData();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const revokeOtherSessions = async () => {
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ revokedCount: number }>('/api/me/sessions/revoke-others', {
+        method: 'POST',
+      });
+      setMsg(
+        res.revokedCount > 0
+          ? `Signed out ${res.revokedCount} other active device(s).`
+          : 'No other active device sessions were found.'
+      );
+      await loadData();
+    } catch (e: any) {
+      setErr(e.message);
+    }
   };
 
   return (
@@ -412,7 +451,7 @@ export const CustomerAccountView: React.FC<CustomerAccountProps> = ({
                   className="aspect-[4/3] bg-[#F5F7F4]"
                 >
                   {w.media?.[0] && (
-                    <img src={w.media[0]} alt={w.name} className="w-full h-full object-cover" />
+                    <img src={resolveMediaUrl(w.media[0])} alt={w.name} className="w-full h-full object-cover" />
                   )}
                 </button>
                 <div className="p-4 flex items-center justify-between gap-2">
@@ -510,6 +549,76 @@ export const CustomerAccountView: React.FC<CustomerAccountProps> = ({
                 Update Password & Revoke Other Sessions
               </button>
             </form>
+
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Laptop className="w-4 h-4 text-[#172554]" />
+                  <h2 className="text-base font-bold text-[#172554]">Active Devices & Sessions</h2>
+                </div>
+                {activeSessions.some((s) => !s.isCurrent) && (
+                  <button
+                    type="button"
+                    onClick={revokeOtherSessions}
+                    className="rounded-lg border border-[#F47B68] px-3 py-1.5 text-xs font-semibold text-[#9A2E1E] hover:bg-[#F47B68]/10"
+                  >
+                    Sign Out Other Devices
+                  </button>
+                )}
+              </div>
+              {activeSessions.length === 0 ? (
+                <p className="text-xs text-slate-500">No active sessions found.</p>
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {activeSessions.map((s) => (
+                    <div key={s.id} className="py-2.5 flex items-center justify-between gap-3 text-xs">
+                      <div>
+                        <div className="font-semibold text-[#172554]">
+                          {s.deviceSummary}{' '}
+                          {s.isCurrent && (
+                            <span className="text-emerald-700 font-bold">· Current Device</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          Signed in {formatLagosDate(s.createdAt)} · Expires {formatLagosDate(s.expiresAt)}
+                        </div>
+                      </div>
+                      {!s.isCurrent && (
+                        <button
+                          type="button"
+                          onClick={() => revokeSingleSession(s.id)}
+                          className="rounded border border-slate-300 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:text-[#9A2E1E]"
+                        >
+                          Sign Out
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {recentLogins.length > 0 && (
+                <div className="pt-3 border-t border-slate-100 space-y-2">
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-[#172554]">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>Recent Sign-In Activity</span>
+                  </div>
+                  <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                    {recentLogins.slice(0, 6).map((lg) => (
+                      <div key={lg.id} className="text-[11px] flex justify-between gap-3 text-slate-600">
+                        <span>
+                          {lg.device_summary} · {lg.approx_location || 'Location unavailable'}
+                          {lg.is_new_device ? ' · New device' : ''}
+                        </span>
+                        <span className="text-slate-400 shrink-0 tabular-nums">
+                          {formatLagosDate(lg.created_at)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
 
             <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-3">
               <h2 className="text-base font-bold text-[#172554]">Personal Information & Privacy</h2>

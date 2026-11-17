@@ -152,7 +152,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
       return;
     }
     if (turnstileSiteKey && !turnstileToken) {
-      setCheckoutError('Please complete the Cloudflare Turnstile security verification check.');
+      setCheckoutError('Please complete the security verification check.');
       return;
     }
     setSubmitting(true);
@@ -229,9 +229,6 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
               <h1 className="text-2xl font-bold text-[#172554] mt-0.5">
                 Order {confirmedOrder.orderNumber}
               </h1>
-              <p className="text-xs text-slate-500 font-mono-tabular mt-1">
-                Internal Order ID: {confirmedOrder.orderId}
-              </p>
             </div>
           </div>
 
@@ -269,8 +266,8 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                 </div>
               ) : (
                 <p className="text-xs text-[#9A2E1E] leading-relaxed">
-                  Store bank account details have not been configured by the owner yet. Please
-                  contact store support or check back on your Track Order page once configured.
+                  Store bank transfer details are currently being updated. Please check your Track
+                  Order page shortly or contact store support.
                 </p>
               )}
             </div>
@@ -486,9 +483,8 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                 </div>
               ) : (
                 <div className="rounded-xl bg-amber-50 border border-amber-200 p-4 text-xs text-amber-900">
-                  Bank transfer instructions have not yet been configured by the store owner in Admin
-                  Settings. You can still place an order if delivery is enabled, or configure bank
-                  details first.
+                  Bank transfer instructions are currently being updated. You can still place your
+                  order and upload payment proof on your Track Order page shortly.
                 </div>
               )}
             </div>

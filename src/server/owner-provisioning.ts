@@ -110,18 +110,18 @@ export async function provisionOwnerInDb(
   const userId = `usr_${randomUuid()}`;
   const hashed = await hashPassword(input.password);
 
-  await db.transaction(async (tx) => {
-    await tx.run(
-      `INSERT INTO user (id, name, email, emailVerified, role, phone, permissionsJson, isActive, notifyOrderUpdates, notifyPromotions, createdAt, updatedAt)
-       VALUES (?, ?, ?, 1, 'owner', ?, ?, 1, 1, 0, ?, ?)`,
-      [userId, input.name.trim(), normalizedEmail, input.phone || null, ownerPermsJson, now, now]
-    );
-    await tx.run(
-      `INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt)
-       VALUES (?, ?, 'credential', ?, ?, ?, ?)`,
-      [`acc_${randomUuid()}`, userId, userId, hashed, now, now]
-    );
-  });
+  await db.batch([
+    {
+      sql: `INSERT INTO user (id, name, email, emailVerified, role, phone, permissionsJson, isActive, notifyOrderUpdates, notifyPromotions, createdAt, updatedAt)
+            VALUES (?, ?, ?, 1, 'owner', ?, ?, 1, 1, 0, ?, ?)`,
+      params: [userId, input.name.trim(), normalizedEmail, input.phone || null, ownerPermsJson, now, now],
+    },
+    {
+      sql: `INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt)
+            VALUES (?, ?, 'credential', ?, ?, ?, ?)`,
+      params: [`acc_${randomUuid()}`, userId, userId, hashed, now, now],
+    },
+  ]);
 
   await writeAuditLog(db, {
     actorId: userId,

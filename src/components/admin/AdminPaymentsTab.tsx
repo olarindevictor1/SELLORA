@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, ExternalLink, XCircle } from 'lucide-react';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, resolveApiUrl } from '../../lib/api';
 import { formatLagosDate, formatNgn, PAYMENT_STATUS_LABELS, type PaymentStatus } from '../../shared/types';
 
 export const AdminPaymentsTab: React.FC = () => {
@@ -117,7 +117,7 @@ export const AdminPaymentsTab: React.FC = () => {
                         </div>
                       </div>
                       <a
-                        href={`/api/payments/evidence/${ev.id}/file`}
+                        href={resolveApiUrl(`/api/payments/evidence/${ev.id}/file`)}
                         target="_blank"
                         rel="noreferrer"
                         className="inline-flex items-center gap-1 rounded-lg border border-[#172554] px-3 py-1.5 font-semibold text-[#172554] hover:bg-[#172554] hover:text-[#B7F36B]"

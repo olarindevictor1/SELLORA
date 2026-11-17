@@ -2,7 +2,11 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomUuid } from '../crypto';
 import type { AppContext } from '../context';
-import { checkRateLimit, isTurnstileConfigured } from '../security';
+import {
+  checkPersistentRateLimit,
+  getTrustedClientIp,
+  isTurnstileConfigured,
+} from '../security';
 import { getEffectiveSeoConfig } from '../seo';
 import { NIGERIAN_STATES_LGAS } from '../../shared/nigeria-locations';
 
@@ -11,15 +15,20 @@ export function createPublicRoutes() {
 
   app.get('/health', async (c) => {
     const db = c.get('db');
+    const storage = c.get('storage');
     try {
       await db.get('SELECT 1 as ok');
-      return c.json({
-        ok: true,
-        service: 'sellora-api',
-        timezone: 'Africa/Lagos',
-        currency: 'NGN',
-        timestamp: new Date().toISOString(),
-      });
+      const hasStorage = Boolean(storage && typeof storage.get === 'function');
+      return c.json(
+        {
+          ok: hasStorage,
+          service: 'sellora-api',
+          timezone: 'Africa/Lagos',
+          currency: 'NGN',
+          timestamp: new Date().toISOString(),
+        },
+        hasStorage ? 200 : 503
+      );
     } catch {
       return c.json({ ok: false, error: 'Database unavailable' }, 503);
     }
@@ -37,8 +46,6 @@ export function createPublicRoutes() {
         googleOAuthEnabled: Boolean(env.googleClientId && env.googleClientSecret),
         turnstileEnabled,
         turnstileSiteKey: turnstileEnabled ? env.turnstileSiteKey?.trim() || null : null,
-        brevoConfigured: Boolean(env.brevoApiKey),
-        aiConfigured: Boolean(env.geminiApiKey),
         gaConfigured: gaValid,
         searchConsoleConfigured: Boolean(env.googleSiteVerification && env.googleSiteVerification.trim()),
       },
@@ -114,8 +121,10 @@ export function createPublicRoutes() {
   });
 
   app.post('/analytics/collect', async (c) => {
-    const ip = c.req.header('x-forwarded-for') || c.req.header('cf-connecting-ip') || 'local';
-    const rl = checkRateLimit(`analytics:${ip}`, 120, 60_000);
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `analytics:${ip}`, 120, 60_000);
     if (!rl.allowed) return c.json({ ok: false }, 429);
 
     const body = await c.req.json().catch(() => ({}));
@@ -152,7 +161,6 @@ export function createPublicRoutes() {
       }
     }
 
-    const db = c.get('db');
     await db
       .run(
         `INSERT INTO analytics_events (id, session_key, event_name, path, referrer_source, device_category, product_id, value_kobo, metadata_json, created_at)
@@ -328,6 +336,11 @@ export function createPublicRoutes() {
     if (!user) return c.json({ error: 'Please sign in to submit a product review.' }, 401);
 
     const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `review:${user.id}:${ip}`, 10, 60_000);
+    if (!rl.allowed) return c.json({ error: 'Too many review submissions. Please wait a moment.' }, 429);
+
     const productId = c.req.param('productId');
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
@@ -370,6 +383,10 @@ export function createPublicRoutes() {
   app.post('/products/:productId/questions', async (c) => {
     const db = c.get('db');
     const user = c.get('user');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `question:${ip}`, 10, 60_000);
+    if (!rl.allowed) return c.json({ error: 'Too many questions submitted. Please wait a moment.' }, 429);
     const productId = c.req.param('productId');
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
@@ -460,6 +477,10 @@ export function createPublicRoutes() {
 
   app.post('/coupons/validate', async (c) => {
     const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `coupon:${ip}`, 20, 60_000);
+    if (!rl.allowed) return c.json({ valid: false, error: 'Too many code attempts. Please wait a moment.' }, 429);
     const body = await c.req.json().catch(() => ({}));
     const code = String(body.code || '').trim().toUpperCase();
     const subtotalKobo = Number(body.subtotalKobo || 0);
@@ -506,15 +527,16 @@ export function createPublicRoutes() {
   });
 
   app.post('/newsletter', async (c) => {
-    const ip = c.req.header('x-forwarded-for') || 'local';
-    const rl = checkRateLimit(`newsletter:${ip}`, 10, 60_000);
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const rl = await checkPersistentRateLimit(db, `newsletter:${ip}`, 10, 60_000);
     if (!rl.allowed) return c.json({ error: 'Too many requests' }, 429);
 
     const body = await c.req.json().catch(() => ({}));
     const parsed = z.object({ email: z.string().email() }).safeParse(body);
     if (!parsed.success) return c.json({ error: 'Enter a valid email address.' }, 400);
 
-    const db = c.get('db');
     await db.run(
       `INSERT OR IGNORE INTO newsletter_subscribers (id, email, created_at) VALUES (?, ?, ?)`,
       [`sub_${randomUuid()}`, parsed.data.email.trim().toLowerCase(), new Date().toISOString()]

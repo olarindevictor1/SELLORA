@@ -1,11 +1,16 @@
 import React, { useEffect, useState } from 'react';
-import { Copy, Plus, Trash2, Upload } from 'lucide-react';
+import { Copy, Pencil, Plus, Trash2, Upload } from 'lucide-react';
 import { apiFetch } from '../../lib/api';
 import { formatLagosDate, formatNgn } from '../../shared/types';
 
-export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory' | 'reviews' }> = ({
+export const AdminCatalogTab: React.FC<{
+  initialSubTab?: 'products' | 'inventory' | 'reviews';
+  user?: any;
+}> = ({
   initialSubTab = 'products',
+  user,
 }) => {
+  const isOwner = user?.role === 'owner';
   const [subTab, setSubTab] = useState<'products' | 'inventory' | 'reviews'>(initialSubTab);
   const [products, setProducts] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
@@ -19,7 +24,6 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
   // Create Product Form
   const [showForm, setShowForm] = useState(false);
   const [pName, setPName] = useState('');
-  const [pSku, setPSku] = useState('');
   const [pShort, setPShort] = useState('');
   const [pDesc, setPDesc] = useState('');
   const [pCategoryId, setPCategoryId] = useState('');
@@ -31,6 +35,19 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
   const [pLowThresh, setPLowThresh] = useState('5');
   const [pImageUrl, setPImageUrl] = useState('');
 
+  // Edit Product Form (SKU preserved read-only)
+  const [editingProd, setEditingProd] = useState<any>(null);
+  const [eName, setEName] = useState('');
+  const [eShort, setEShort] = useState('');
+  const [eDesc, setEDesc] = useState('');
+  const [eCategoryId, setECategoryId] = useState('');
+  const [eCollectionId, setECollectionId] = useState('');
+  const [ePrice, setEPrice] = useState('');
+  const [eSalePrice, setESalePrice] = useState('');
+  const [eCostPrice, setECostPrice] = useState('');
+  const [eLowThresh, setELowThresh] = useState('5');
+  const [eImageUrl, setEImageUrl] = useState('');
+
   // Quick Category
   const [newCatName, setNewCatName] = useState('');
 
@@ -38,19 +55,6 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
   const [adjVariantId, setAdjVariantId] = useState('');
   const [adjAmount, setAdjAmount] = useState('');
   const [adjReason, setAdjReason] = useState('');
-
-  // Inline Product SEO Editor
-  const [editingSeoProd, setEditingSeoProd] = useState<any>(null);
-  const [seoTitle, setSeoTitle] = useState('');
-  const [seoDesc, setSeoDesc] = useState('');
-  const [seoCanonical, setSeoCanonical] = useState('');
-  const [seoImage, setSeoImage] = useState('');
-  const [imageAlt, setImageAlt] = useState('');
-
-  // Inline Category SEO Editor
-  const [editingSeoCat, setEditingSeoCat] = useState<any>(null);
-  const [catSeoTitle, setCatSeoTitle] = useState('');
-  const [catSeoDesc, setCatSeoDesc] = useState('');
 
   const load = async () => {
     try {
@@ -76,14 +80,18 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
     load();
   }, []);
 
-  const uploadProductImage = async (file: File) => {
+  const uploadProductImage = async (file: File, target: 'create' | 'edit' = 'create') => {
     const form = new FormData();
     form.append('file', file);
     const res = await apiFetch<{ url: string }>('/api/admin/media/upload', {
       method: 'POST',
       body: form,
     });
-    setPImageUrl(res.url);
+    if (target === 'edit') {
+      setEImageUrl(res.url);
+    } else {
+      setPImageUrl(res.url);
+    }
     setMsg('Product image uploaded.');
   };
 
@@ -91,11 +99,10 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
     e.preventDefault();
     setErr(null);
     try {
-      await apiFetch('/api/admin/products', {
+      const res = await apiFetch<{ id: string; sku: string }>('/api/admin/products', {
         method: 'POST',
         body: JSON.stringify({
           name: pName,
-          sku: pSku,
           shortDescription: pShort,
           description: pDesc,
           categoryId: pCategoryId || null,
@@ -112,23 +119,74 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
       });
       setShowForm(false);
       setPName('');
-      setPSku('');
       setPShort('');
       setPDesc('');
       setPPrice('');
       setPSalePrice('');
       setPCostPrice('');
       setPImageUrl('');
-      setMsg('Product created in database.');
+      setMsg(`Product created with assigned SKU ${res.sku}.`);
       await load();
     } catch (e: any) {
       setErr(e.message);
     }
   };
 
+  const openEditProduct = (p: any) => {
+    setShowForm(false);
+    setEditingProd(p);
+    setEName(p.name || '');
+    setEShort(p.short_description || '');
+    setEDesc(p.description || '');
+    setECategoryId(p.category_id || '');
+    setECollectionId(p.collection_id || '');
+    setEPrice(p.price_kobo !== null && p.price_kobo !== undefined ? String(p.price_kobo / 100) : '');
+    setESalePrice(p.sale_price_kobo !== null && p.sale_price_kobo !== undefined ? String(p.sale_price_kobo / 100) : '');
+    setECostPrice(p.cost_price_kobo !== null && p.cost_price_kobo !== undefined ? String(p.cost_price_kobo / 100) : '');
+    setELowThresh(String(p.low_stock_threshold ?? 5));
+    setEImageUrl((p.media && p.media[0]) || '');
+  };
+
+  const saveEditProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingProd) return;
+    setErr(null);
+    try {
+      await apiFetch(`/api/admin/products/${editingProd.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: eName,
+          shortDescription: eShort,
+          description: eDesc,
+          categoryId: eCategoryId || null,
+          collectionId: eCollectionId || null,
+          priceNaira: Number(ePrice),
+          salePriceNaira: eSalePrice ? Number(eSalePrice) : null,
+          costPriceNaira: eCostPrice ? Number(eCostPrice) : null,
+          lowStockThreshold: Number(eLowThresh || 5),
+          media: eImageUrl ? [eImageUrl] : editingProd.media || [],
+        }),
+      });
+      setEditingProd(null);
+      setMsg('Product updated. Existing SKU preserved.');
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const copySku = async (sku: string) => {
+    try {
+      await navigator.clipboard.writeText(sku);
+      setMsg(`Copied SKU: ${sku}`);
+    } catch {
+      setMsg(`SKU: ${sku}`);
+    }
+  };
+
   const duplicateProduct = async (id: string) => {
-    await apiFetch(`/api/admin/products/${id}/duplicate`, { method: 'POST' });
-    setMsg('Product duplicated as draft.');
+    const res = await apiFetch<{ sku?: string }>(`/api/admin/products/${id}/duplicate`, { method: 'POST' });
+    setMsg(res?.sku ? `Product duplicated as draft with SKU ${res.sku}.` : 'Product duplicated as draft.');
     await load();
   };
 
@@ -155,64 +213,6 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
     });
     setNewCatName('');
     await load();
-  };
-
-  const openProductSeo = (p: any) => {
-    setEditingSeoProd(p);
-    setSeoTitle(p.seo_title || '');
-    setSeoDesc(p.seo_description || '');
-    setSeoCanonical(p.seo_canonical_url || '');
-    setSeoImage(p.seo_image_url || '');
-    setImageAlt(p.image_alt || '');
-  };
-
-  const saveProductSeo = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingSeoProd) return;
-    setErr(null);
-    try {
-      await apiFetch(`/api/admin/products/${editingSeoProd.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          seoTitle,
-          seoDescription: seoDesc,
-          seoCanonicalUrl: seoCanonical,
-          seoImageUrl: seoImage,
-          imageAlt,
-        }),
-      });
-      setEditingSeoProd(null);
-      setMsg('Product SEO metadata saved.');
-      await load();
-    } catch (e: any) {
-      setErr(e.message);
-    }
-  };
-
-  const openCategorySeo = (c: any) => {
-    setEditingSeoCat(c);
-    setCatSeoTitle(c.seo_title || '');
-    setCatSeoDesc(c.seo_description || '');
-  };
-
-  const saveCategorySeo = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingSeoCat) return;
-    setErr(null);
-    try {
-      await apiFetch(`/api/admin/categories/${editingSeoCat.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          seoTitle: catSeoTitle,
-          seoDescription: catSeoDesc,
-        }),
-      });
-      setEditingSeoCat(null);
-      setMsg('Category SEO metadata saved.');
-      await load();
-    } catch (e: any) {
-      setErr(e.message);
-    }
   };
 
   const adjustInventory = async (e: React.FormEvent) => {
@@ -305,14 +305,9 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
                   placeholder="Product Name *"
                   className="rounded-lg border border-slate-300 px-3 py-2"
                 />
-                <input
-                  type="text"
-                  required
-                  value={pSku}
-                  onChange={(e) => setPSku(e.target.value)}
-                  placeholder="SKU (e.g. SLR-NEW-005) *"
-                  className="rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular"
-                />
+                <div className="rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 text-slate-500 flex items-center">
+                  SKU assigned automatically on save
+                </div>
                 <select
                   value={pCategoryId}
                   onChange={(e) => setPCategoryId(e.target.value)}
@@ -396,18 +391,18 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
               <div className="flex flex-wrap items-center gap-3">
                 <label className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 cursor-pointer hover:bg-slate-50">
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Upload Image to Storage</span>
+                  <span>Upload Product Image</span>
                   <input
                     type="file"
                     accept="image/png,image/jpeg,image/webp"
                     className="hidden"
                     onChange={(e) => {
                       const f = e.target.files?.[0];
-                      if (f) uploadProductImage(f);
+                      if (f) uploadProductImage(f, 'create');
                     }}
                   />
                 </label>
-                {pImageUrl && <span className="text-emerald-700 font-mono-tabular">{pImageUrl}</span>}
+                {pImageUrl && <span className="text-emerald-700 truncate max-w-xs">{pImageUrl}</span>}
               </div>
               <div className="flex gap-2">
                 <button
@@ -450,7 +445,22 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
                   return (
                     <tr key={p.id}>
                       <td className="p-3 font-semibold text-[#172554]">{p.name}</td>
-                      <td className="p-3 font-mono-tabular text-slate-500">{p.sku}</td>
+                      <td className="p-3 font-mono-tabular text-slate-600">
+                        <div className="inline-flex items-center gap-1.5">
+                          <span>{p.sku}</span>
+                          {isOwner && p.sku && (
+                            <button
+                              type="button"
+                              onClick={() => copySku(p.sku)}
+                              title={`Copy SKU ${p.sku}`}
+                              aria-label={`Copy SKU ${p.sku}`}
+                              className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-[#172554]"
+                            >
+                              <Copy className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
                       <td className="p-3 text-slate-600">{p.category_name || '—'}</td>
                       <td className="p-3 text-right tabular-nums font-semibold">
                         {formatNgn(p.sale_price_kobo ?? p.price_kobo)}
@@ -458,13 +468,14 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
                       <td className="p-3 text-right tabular-nums">{totalStock}</td>
                       <td className="p-3 capitalize">{p.status}</td>
                       <td className="p-3 text-right">
-                        <div className="inline-flex items-center gap-2">
+                        <div className="inline-flex items-center gap-2.5">
                           <button
                             type="button"
-                            onClick={() => openProductSeo(p)}
-                            className="text-[#172554] underline"
+                            onClick={() => openEditProduct(p)}
+                            title="Edit Product"
+                            className="inline-flex items-center gap-1 text-[#172554] underline"
                           >
-                            Edit SEO
+                            <Pencil className="w-3 h-3" /> Edit
                           </button>
                           <button
                             type="button"
@@ -498,81 +509,157 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
             </table>
           </div>
 
-          {editingSeoProd && (
+          {editingProd && (
             <form
-              onSubmit={saveProductSeo}
-              className="rounded-xl bg-white border border-[#172554]/25 p-5 space-y-3 text-xs"
+              onSubmit={saveEditProduct}
+              className="rounded-xl bg-white border border-[#172554]/25 p-6 space-y-4 text-xs"
             >
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-bold text-[#172554]">
-                  Product SEO & Image Alt: {editingSeoProd.name}
-                </h3>
-                <span className="font-mono-tabular text-slate-400">
-                  /product/{editingSeoProd.slug}
-                </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-bold text-[#172554]">Edit Product: {editingProd.name}</h3>
+                <span className="text-slate-500">Existing SKU is preserved and never regenerated</span>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
-                  <label className="block font-semibold mb-1">SEO Title (30–60 chars)</label>
+                  <label className="block font-semibold mb-1">Product Name *</label>
                   <input
                     type="text"
-                    value={seoTitle}
-                    onChange={(e) => setSeoTitle(e.target.value)}
-                    placeholder={`${editingSeoProd.name} — SELLORA`}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold mb-1">Image Alt Text</label>
-                  <input
-                    type="text"
-                    value={imageAlt}
-                    onChange={(e) => setImageAlt(e.target.value)}
-                    placeholder={`Descriptive alt text for ${editingSeoProd.name}`}
+                    required
+                    value={eName}
+                    onChange={(e) => setEName(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2"
                   />
                 </div>
                 <div>
-                  <label className="block font-semibold mb-1">Canonical URL Override (optional)</label>
+                  <label className="block font-semibold mb-1">Assigned SKU (Read-only)</label>
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 font-mono-tabular text-slate-600">
+                    <span className="flex-1 truncate">{editingProd.sku}</span>
+                    {isOwner && editingProd.sku && (
+                      <button
+                        type="button"
+                        onClick={() => copySku(editingProd.sku)}
+                        className="text-[#172554] hover:underline font-sans text-[11px] font-semibold"
+                      >
+                        Copy
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">Category</label>
+                  <select
+                    value={eCategoryId}
+                    onChange={(e) => setECategoryId(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                  >
+                    <option value="">Select Category</option>
+                    {categories.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">Collection</label>
+                  <select
+                    value={eCollectionId}
+                    onChange={(e) => setECollectionId(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                  >
+                    <option value="">Select Collection</option>
+                    {collections.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">Regular Price (NGN) *</label>
                   <input
-                    type="text"
-                    value={seoCanonical}
-                    onChange={(e) => setSeoCanonical(e.target.value)}
-                    placeholder={`/product/${editingSeoProd.slug}`}
+                    type="number"
+                    step="0.01"
+                    required
+                    value={ePrice}
+                    onChange={(e) => setEPrice(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2"
                   />
                 </div>
                 <div>
-                  <label className="block font-semibold mb-1">Social Share / OG Image URL</label>
+                  <label className="block font-semibold mb-1">Sale Price (NGN)</label>
                   <input
-                    type="text"
-                    value={seoImage}
-                    onChange={(e) => setSeoImage(e.target.value)}
-                    placeholder="https://... or /api/media/products/..."
+                    type="number"
+                    step="0.01"
+                    value={eSalePrice}
+                    onChange={(e) => setESalePrice(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2"
                   />
                 </div>
-                <div className="sm:col-span-2">
-                  <label className="block font-semibold mb-1">SEO Meta Description (120–160 chars)</label>
-                  <textarea
-                    rows={2}
-                    value={seoDesc}
-                    onChange={(e) => setSeoDesc(e.target.value)}
-                    placeholder="Concise search snippet summarizing product benefits and NGN value..."
+                <div>
+                  <label className="block font-semibold mb-1">Cost Price (NGN)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={eCostPrice}
+                    onChange={(e) => setECostPrice(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2"
                   />
                 </div>
+                <div>
+                  <label className="block font-semibold mb-1">Low-Stock Threshold</label>
+                  <input
+                    type="number"
+                    required
+                    value={eLowThresh}
+                    onChange={(e) => setELowThresh(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block font-semibold mb-1">Short Summary</label>
+                <input
+                  type="text"
+                  value={eShort}
+                  onChange={(e) => setEShort(e.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                />
+              </div>
+              <div>
+                <label className="block font-semibold mb-1">Full Product Description</label>
+                <textarea
+                  rows={3}
+                  value={eDesc}
+                  onChange={(e) => setEDesc(e.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 cursor-pointer hover:bg-slate-50">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Replace Product Image</span>
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) uploadProductImage(f, 'edit');
+                    }}
+                  />
+                </label>
+                {eImageUrl && <span className="text-emerald-700 truncate max-w-xs">{eImageUrl}</span>}
               </div>
               <div className="flex gap-2">
                 <button
                   type="submit"
                   className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
                 >
-                  Save Product SEO
+                  Save Changes
                 </button>
                 <button
                   type="button"
-                  onClick={() => setEditingSeoProd(null)}
+                  onClick={() => setEditingProd(null)}
                   className="rounded-lg border border-slate-300 px-4 py-2 font-semibold text-slate-600"
                 >
                   Cancel
@@ -581,7 +668,7 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
             </form>
           )}
 
-          {/* Quick Category Creator & Category SEO */}
+          {/* Quick Category Creator */}
           <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-3 text-xs">
             <form onSubmit={addCategory} className="flex flex-wrap items-center gap-3">
               <span className="font-bold text-[#172554]">Categories ({categories.length}):</span>
@@ -601,52 +688,14 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
             </form>
             <div className="flex flex-wrap gap-2">
               {categories.map((c) => (
-                <button
+                <span
                   key={c.id}
-                  type="button"
-                  onClick={() => openCategorySeo(c)}
-                  className="rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-1.5 text-xs font-medium text-[#172554] hover:border-[#172554]"
+                  className="rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-1.5 text-xs font-medium text-[#172554]"
                 >
-                  {c.name} · Edit SEO
-                </button>
+                  {c.name}
+                </span>
               ))}
             </div>
-            {editingSeoCat && (
-              <form
-                onSubmit={saveCategorySeo}
-                className="pt-3 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-3"
-              >
-                <input
-                  type="text"
-                  value={catSeoTitle}
-                  onChange={(e) => setCatSeoTitle(e.target.value)}
-                  placeholder={`${editingSeoCat.name} — SELLORA`}
-                  className="rounded-lg border border-slate-300 px-3 py-2"
-                />
-                <input
-                  type="text"
-                  value={catSeoDesc}
-                  onChange={(e) => setCatSeoDesc(e.target.value)}
-                  placeholder="Category search description..."
-                  className="rounded-lg border border-slate-300 px-3 py-2"
-                />
-                <div className="sm:col-span-2 flex gap-2">
-                  <button
-                    type="submit"
-                    className="rounded-lg bg-[#172554] px-3.5 py-1.5 font-bold text-[#B7F36B]"
-                  >
-                    Save Category SEO
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEditingSeoCat(null)}
-                    className="rounded-lg border border-slate-300 px-3.5 py-1.5 font-semibold text-slate-600"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </form>
-            )}
           </div>
         </div>
       )}
@@ -658,17 +707,17 @@ export const AdminCatalogTab: React.FC<{ initialSubTab?: 'products' | 'inventory
             className="rounded-xl bg-white border border-slate-200 p-5 grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs items-end"
           >
             <div>
-              <label className="block font-semibold mb-1">Variant / SKU</label>
+              <label className="block font-semibold mb-1">Product Variant</label>
               <select
                 required
                 value={adjVariantId}
                 onChange={(e) => setAdjVariantId(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2"
               >
-                <option value="">Select SKU</option>
+                <option value="">Select product variant</option>
                 {inventory.map((i) => (
                   <option key={i.id} value={i.id}>
-                    {i.sku} — {i.product_name} ({i.stock_quantity} on hand)
+                    {i.product_name} — {i.name} ({i.stock_quantity} on hand)
                   </option>
                 ))}
               </select>

@@ -1,3 +1,5 @@
+import { resolveApiUrl } from './api';
+
 declare global {
   interface Window {
     dataLayer?: unknown[];
@@ -104,7 +106,7 @@ function postFirstPartyEvent(payload: {
   if (getAnalyticsConsent() === 'denied') return;
 
   const cleanPath = payload.path.split('?')[0] || '/';
-  fetch('/api/analytics/collect', {
+  fetch(resolveApiUrl('/api/analytics/collect'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     keepalive: true,

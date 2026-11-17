@@ -32,7 +32,7 @@ function loadTurnstileScript(): Promise<void> {
     );
     if (existing) {
       existing.addEventListener('load', () => resolve(), { once: true });
-      existing.addEventListener('error', () => reject(new Error('Failed to load Turnstile')), {
+      existing.addEventListener('error', () => reject(new Error('Failed to load security verification')), {
         once: true,
       });
       return;
@@ -45,7 +45,7 @@ function loadTurnstileScript(): Promise<void> {
     script.onload = () => resolve();
     script.onerror = () => {
       turnstileScriptPromise = null;
-      reject(new Error('Unable to load Cloudflare Turnstile security widget.'));
+      reject(new Error('Unable to load security verification widget.'));
     };
     document.head.appendChild(script);
   });
@@ -109,7 +109,7 @@ export const TurnstileWidget: React.FC<TurnstileWidgetProps> = ({
         if (!cancelled) {
           onTokenRef.current(null);
           onErrorRef.current?.(
-            err instanceof Error ? err.message : 'Unable to initialize Turnstile check.'
+            err instanceof Error ? err.message : 'Unable to initialize security verification.'
           );
         }
       });

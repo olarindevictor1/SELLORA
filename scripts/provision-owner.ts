@@ -26,7 +26,7 @@ async function main() {
   const email = (
     readArg('--email') ||
     process.env.OWNER_EMAIL ||
-    'olarindevictor3@gmail.com'
+    'olarindevictor046@gmail.com'
   )
     .trim()
     .toLowerCase();

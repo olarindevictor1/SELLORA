@@ -1,7 +1,12 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { randomHex, randomUuid } from '../crypto';
+import { randomHex, randomUuid, sha256Hex } from '../crypto';
 import type { AppContext } from '../context';
+import {
+  extractDbGuardCode,
+  isUniqueConstraintError,
+  type BatchStatement,
+} from '../db';
 import {
   dispatchSingleEmailEvent,
   getEffectiveEmailConfig,
@@ -10,11 +15,18 @@ import {
   renderSelloraEmailHtml,
   triggerOrderNotifications,
 } from '../email';
-import { writeAuditLog } from '../security';
+import {
+  recordSecurityEvent,
+  requireRecentAuthSession,
+  validateUploadedFileBytes,
+  writeAuditLog,
+} from '../security';
 import { getEffectiveSeoConfig } from '../seo';
 import {
   ALL_PERMISSIONS,
+  DELIVERY_STATUSES,
   formatNgn,
+  ORDER_STATUSES,
   ORDER_STATUS_LABELS,
   ROLE_DEFAULT_PERMISSIONS,
   STAFF_ROLES,
@@ -33,6 +45,22 @@ function requirePerm(perm?: Permission) {
     }
     await next();
   };
+}
+
+function buildSkuPrefix(name: string): string {
+  const cleaned = name.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned.length >= 3) return cleaned.slice(0, 3);
+  return (cleaned + 'PRD').slice(0, 3);
+}
+
+function generateAutoProductSku(name: string): string {
+  const prefix = buildSkuPrefix(name);
+  const entropy = randomHex(3).toUpperCase();
+  return `SLR-${prefix}-${entropy}`;
+}
+
+function generateAutoVariantSku(productSku: string, index = 1): string {
+  return `${productSku.toUpperCase()}-V${index}`;
 }
 
 export function createAdminRoutes() {
@@ -543,25 +571,22 @@ export function createAdminRoutes() {
     if (!order) return c.json({ error: 'Order not found' }, 404);
 
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `UPDATE orders SET acknowledged_at = COALESCE(acknowledged_at, ?), acknowledged_by = COALESCE(acknowledged_by, ?), needs_attention = 0, updated_at = ? WHERE order_id = ?`,
-        [now, user.id, now, orderId]
-      );
-      await tx.run(
-        `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-         VALUES (?, ?, 'order', ?, ?, ?, ?, 'Order acknowledged as received by store administration (note: separate from payment confirmation).', ?)`,
-        [
-          `hist_${randomUuid()}`,
-          orderId,
-          order.order_status,
-          order.order_status,
-          user.id,
-          user.name,
-          now,
-        ]
-      );
-    });
+    try {
+      await db.batch([
+        {
+          sql: `UPDATE orders SET acknowledged_at = COALESCE(acknowledged_at, ?), acknowledged_by = COALESCE(acknowledged_by, ?), needs_attention = 0, updated_at = ? WHERE order_id = ?`,
+          params: [now, user.id, now, orderId],
+        },
+        {
+          // Scalar subquery on NOT NULL new_status aborts batch if order row vanished concurrently
+          sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+                VALUES (?, ?, 'order', ?, (SELECT order_status FROM orders WHERE order_id = ?), ?, ?, 'Order acknowledged as received by store administration (note: separate from payment confirmation).', ?)`,
+          params: [`hist_${randomUuid()}`, orderId, order.order_status, orderId, user.id, user.name, now],
+        },
+      ]);
+    } catch {
+      return c.json({ error: 'Order not found or modified concurrently.' }, 409);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -603,8 +628,8 @@ export function createAdminRoutes() {
 
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
-      orderStatus: z.string().optional(),
-      deliveryStatus: z.string().optional(),
+      orderStatus: z.enum(ORDER_STATUSES).optional(),
+      deliveryStatus: z.enum(DELIVERY_STATUSES).optional(),
       courierName: z.string().max(120).optional(),
       trackingReference: z.string().max(120).optional(),
       estimatedDeliveryDate: z.string().max(40).optional(),
@@ -620,9 +645,12 @@ export function createAdminRoutes() {
     const nextDeliveryStatus = parsed.data.deliveryStatus || order.delivery_status;
     const now = new Date().toISOString();
 
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `UPDATE orders SET
+    const orderStatusChanged = nextOrderStatus !== order.order_status;
+    const deliveryStatusChanged = nextDeliveryStatus !== order.delivery_status;
+
+    const statusBatch: BatchStatement[] = [
+      {
+        sql: `UPDATE orders SET
           order_status = ?,
           delivery_status = ?,
           courier_name = COALESCE(?, courier_name),
@@ -633,8 +661,8 @@ export function createAdminRoutes() {
           cancellation_reason = COALESCE(?, cancellation_reason),
           needs_attention = 0,
           updated_at = ?
-        WHERE order_id = ?`,
-        [
+        WHERE order_id = ? AND order_status = ? AND delivery_status = ?`,
+        params: [
           nextOrderStatus,
           nextDeliveryStatus,
           parsed.data.courierName ?? null,
@@ -645,43 +673,57 @@ export function createAdminRoutes() {
           parsed.data.cancellationReason ?? null,
           now,
           orderId,
-        ]
-      );
+          order.order_status,
+          order.delivery_status,
+        ],
+      },
+    ];
 
-      if (nextOrderStatus !== order.order_status) {
-        await tx.run(
-          `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-           VALUES (?, ?, 'order', ?, ?, ?, ?, ?, ?)`,
-          [
-            `hist_${randomUuid()}`,
-            orderId,
-            order.order_status,
-            nextOrderStatus,
-            user.id,
-            user.name,
-            parsed.data.note || parsed.data.cancellationReason || `Updated by ${user.name}`,
-            now,
-          ]
-        );
-      }
+    if (orderStatusChanged) {
+      statusBatch.push({
+        // Scalar subquery verifies orders.updated_at = now so a 0-row concurrent conflict fails NOT NULL & rolls back
+        sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+              VALUES (?, ?, 'order', ?, (SELECT CASE WHEN updated_at = ? THEN order_status ELSE NULL END FROM orders WHERE order_id = ?), ?, ?, ?, ?)`,
+        params: [
+          `hist_${randomUuid()}`,
+          orderId,
+          order.order_status,
+          now,
+          orderId,
+          user.id,
+          user.name,
+          parsed.data.note || parsed.data.cancellationReason || `Updated by ${user.name}`,
+          now,
+        ],
+      });
+    }
 
-      if (nextDeliveryStatus !== order.delivery_status) {
-        await tx.run(
-          `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-           VALUES (?, ?, 'delivery', ?, ?, ?, ?, ?, ?)`,
-          [
-            `hist_${randomUuid()}`,
-            orderId,
-            order.delivery_status,
-            nextDeliveryStatus,
-            user.id,
-            user.name,
-            parsed.data.deliveryNotes || parsed.data.note || `Delivery updated by ${user.name}`,
-            now,
-          ]
-        );
+    if (deliveryStatusChanged) {
+      statusBatch.push({
+        sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+              VALUES (?, ?, 'delivery', ?, (SELECT CASE WHEN updated_at = ? THEN delivery_status ELSE NULL END FROM orders WHERE order_id = ?), ?, ?, ?, ?)`,
+        params: [
+          `hist_${randomUuid()}`,
+          orderId,
+          order.delivery_status,
+          now,
+          orderId,
+          user.id,
+          user.name,
+          parsed.data.deliveryNotes || parsed.data.note || `Delivery updated by ${user.name}`,
+          now,
+        ],
+      });
+    }
+
+    try {
+      const batchRes = await db.batch(statusBatch);
+      if (batchRes[0].changes === 0) {
+        return c.json({ error: 'Order state changed concurrently. Please refresh and retry.' }, 409);
       }
-    });
+    } catch {
+      return c.json({ error: 'Order state changed concurrently. Please refresh and retry.' }, 409);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -746,18 +788,31 @@ export function createAdminRoutes() {
     if (!order) return c.json({ error: 'Order not found' }, 404);
 
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `UPDATE orders SET order_status = ?, payment_status = ?, updated_at = ? WHERE order_id = ?`,
-        [status, status, now, orderId]
-      );
-      await tx.run(`UPDATE payments SET status = ?, updated_at = ? WHERE order_id = ?`, [status, now, orderId]);
-      await tx.run(
-        `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-         VALUES (?, ?, 'order', ?, ?, ?, ?, ?, ?)`,
-        [`hist_${randomUuid()}`, orderId, order.order_status, status, user.id, user.name, note, now]
-      );
-    });
+    try {
+      await db.batch([
+        {
+          // trg_payments_guard_transition prevents invalid refund regression (refunded -> refund_pending)
+          sql: `UPDATE payments SET status = ?, updated_at = ? WHERE order_id = ?`,
+          params: [status, now, orderId],
+        },
+        {
+          sql: `UPDATE orders SET order_status = ?, payment_status = ?, updated_at = ? WHERE order_id = ?`,
+          params: [status, status, now, orderId],
+        },
+        {
+          // Scalar subquery on NOT NULL new_status aborts batch if payments row is missing
+          sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+                VALUES (?, ?, 'order', ?, (SELECT status FROM payments WHERE order_id = ?), ?, ?, ?, ?)`,
+          params: [`hist_${randomUuid()}`, orderId, order.order_status, orderId, user.id, user.name, note, now],
+        },
+      ]);
+    } catch (err) {
+      const guardCode = extractDbGuardCode(err);
+      if (guardCode === 'INVALID_PAYMENT_STATE') {
+        return c.json({ error: 'Cannot revert an already refunded payment to refund pending.' }, 409);
+      }
+      return c.json({ error: 'Unable to update refund status; payment or order missing.' }, 400);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -870,24 +925,42 @@ export function createAdminRoutes() {
     }
 
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `UPDATE payments SET status = 'payment_confirmed', verified_by = ?, verified_at = ?, rejection_reason = '', updated_at = ? WHERE order_id = ?`,
-        [user.id, now, now, orderId]
-      );
-      const nextOrderStatus = ['pending_payment', 'payment_under_review'].includes(String(order.order_status))
-        ? 'payment_confirmed'
-        : order.order_status;
-      await tx.run(
-        `UPDATE orders SET payment_status = 'payment_confirmed', order_status = ?, needs_attention = 0, updated_at = ? WHERE order_id = ?`,
-        [nextOrderStatus, now, orderId]
-      );
-      await tx.run(
-        `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-         VALUES (?, ?, 'payment', ?, 'payment_confirmed', ?, ?, 'Manual bank transfer verified and confirmed by administrator.', ?)`,
-        [`hist_${randomUuid()}`, orderId, payment.status, user.id, user.name, now]
-      );
-    });
+    try {
+      await db.batch([
+        {
+          // trg_payments_guard_transition aborts Statement 1 if another admin already verified concurrently
+          sql: `UPDATE payments SET status = 'payment_confirmed', verified_by = ?, verified_at = ?, rejection_reason = '', updated_at = ? WHERE order_id = ?`,
+          params: [user.id, now, now, orderId],
+        },
+        {
+          sql: `UPDATE orders SET
+            payment_status = 'payment_confirmed',
+            order_status = CASE
+              WHEN order_status IN ('pending_payment', 'payment_under_review')
+              THEN 'payment_confirmed'
+              ELSE order_status
+            END,
+            needs_attention = 0,
+            updated_at = ?
+            WHERE order_id = ?`,
+          params: [now, orderId],
+        },
+        {
+          sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+                VALUES (?, ?, 'payment', ?, (SELECT status FROM payments WHERE order_id = ?), ?, ?, 'Manual bank transfer verified and confirmed by administrator.', ?)`,
+          params: [`hist_${randomUuid()}`, orderId, payment.status, orderId, user.id, user.name, now],
+        },
+      ]);
+    } catch (err) {
+      const guardCode = extractDbGuardCode(err);
+      if (guardCode === 'PAYMENT_ALREADY_CONFIRMED') {
+        return c.json({ ok: true, idempotent: true });
+      }
+      if (guardCode === 'INVALID_PAYMENT_STATE') {
+        return c.json({ error: 'Payment can no longer be confirmed in its current state.' }, 409);
+      }
+      return c.json({ error: 'Unable to verify payment.' }, 400);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -931,21 +1004,39 @@ export function createAdminRoutes() {
     if (!payment) return c.json({ error: 'Payment record not found' }, 404);
 
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `UPDATE payments SET status = 'payment_rejected', rejection_reason = ?, updated_at = ? WHERE order_id = ?`,
-        [reason, now, orderId]
-      );
-      await tx.run(
-        `UPDATE orders SET payment_status = 'payment_rejected', order_status = 'pending_payment', needs_attention = 1, updated_at = ? WHERE order_id = ?`,
-        [now, orderId]
-      );
-      await tx.run(
-        `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
-         VALUES (?, ?, 'payment', ?, 'payment_rejected', ?, ?, ?, ?)`,
-        [`hist_${randomUuid()}`, orderId, payment.status, user.id, user.name, reason, now]
-      );
-    });
+    try {
+      await db.batch([
+        {
+          // trg_payments_guard_transition aborts if payment is already confirmed or refunded
+          sql: `UPDATE payments SET status = 'payment_rejected', rejection_reason = ?, updated_at = ? WHERE order_id = ?`,
+          params: [reason, now, orderId],
+        },
+        {
+          sql: `UPDATE orders SET
+            payment_status = 'payment_rejected',
+            order_status = CASE
+              WHEN order_status IN ('pending_payment', 'payment_under_review', 'payment_rejected')
+              THEN 'pending_payment'
+              ELSE order_status
+            END,
+            needs_attention = 1,
+            updated_at = ?
+            WHERE order_id = ?`,
+          params: [now, orderId],
+        },
+        {
+          sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+                VALUES (?, ?, 'payment', ?, (SELECT status FROM payments WHERE order_id = ?), ?, ?, ?, ?)`,
+          params: [`hist_${randomUuid()}`, orderId, payment.status, orderId, user.id, user.name, reason, now],
+        },
+      ]);
+    } catch (err) {
+      const guardCode = extractDbGuardCode(err);
+      if (guardCode === 'CANNOT_REJECT_CONFIRMED_PAYMENT') {
+        return c.json({ error: 'Cannot reject a payment that has already been confirmed or refunded.' }, 409);
+      }
+      return c.json({ error: 'Unable to reject payment.' }, 400);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -1011,16 +1102,68 @@ export function createAdminRoutes() {
     const form = await c.req.formData().catch(() => null);
     const file = form?.get('file');
     if (!(file instanceof File)) return c.json({ error: 'File required' }, 400);
-    if (!['image/png', 'image/jpeg', 'image/webp', 'video/mp4'].includes(file.type)) {
+    const allowed = ['image/png', 'image/jpeg', 'image/webp', 'video/mp4'];
+    if (!allowed.includes(file.type)) {
       return c.json({ error: 'Unsupported media format' }, 400);
     }
     if (file.size > 8 * 1024 * 1024) return c.json({ error: 'File exceeds 8MB limit' }, 400);
 
-    const ext = file.type.split('/')[1] || 'bin';
-    const fileName = `prod_${randomUuid()}.${ext}`;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const magic = validateUploadedFileBytes(bytes, file.type, allowed);
+    if (!magic.ok) {
+      return c.json({ error: magic.error }, 400);
+    }
+
+    const fileName = `prod_${randomUuid()}.${magic.extension}`;
     const key = `products/${fileName}`;
-    await storage.put(key, new Uint8Array(await file.arrayBuffer()), file.type);
+    await storage.put(key, bytes, magic.detectedMime);
     return c.json({ ok: true, url: `/api/media/products/${fileName}` }, 201);
+  });
+
+  app.delete('/media/:file', requirePerm('products:write'), async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const storage = c.get('storage');
+    const file = c.req.param('file').replace(/[^a-zA-Z0-9._-]/g, '');
+    if (!file || !file.startsWith('prod_')) {
+      return c.json({ error: 'Invalid media identifier.' }, 400);
+    }
+    const key = `products/${file}`;
+
+    const prodRows = await db.all<{ media_json: string; seo_image_url: string | null }>(
+      `SELECT media_json, seo_image_url FROM products`
+    );
+    const catRows = await db.all<{ image_url: string | null }>(`SELECT image_url FROM categories`);
+    const colRows = await db.all<{ banner_url: string | null }>(`SELECT banner_url FROM collections`);
+    const isReferenced =
+      prodRows.some(
+        (p) =>
+          (p.media_json || '').includes(file) || (p.seo_image_url || '').includes(file)
+      ) ||
+      catRows.some((cat) => (cat.image_url || '').includes(file)) ||
+      colRows.some((col) => (col.banner_url || '').includes(file));
+
+    if (isReferenced) {
+      return c.json(
+        { error: 'Media file is still referenced by a product, category, or collection.' },
+        409
+      );
+    }
+
+    const existing = await storage.get(key);
+    if (!existing) {
+      return c.json({ error: 'Media not found' }, 404);
+    }
+    await storage.delete(key);
+    await writeAuditLog(db, {
+      actorId: user.id,
+      actorEmail: user.email,
+      actorRole: user.role,
+      action: 'MEDIA_DELETED',
+      targetType: 'storage',
+      targetId: key,
+    });
+    return c.json({ ok: true, deletedKey: key });
   });
 
   app.post('/products', requirePerm('products:write'), async (c) => {
@@ -1029,7 +1172,7 @@ export function createAdminRoutes() {
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
       name: z.string().min(2).max(160),
-      sku: z.string().min(2).max(60),
+      sku: z.string().max(60).optional(),
       barcode: z.string().max(60).optional(),
       brand: z.string().max(80).optional(),
       shortDescription: z.string().max(300).optional(),
@@ -1057,67 +1200,94 @@ export function createAdminRoutes() {
     const d = parsed.data;
     const productId = `prod_${randomUuid()}`;
     const variantId = `var_${randomUuid()}`;
-    const slug = `${d.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}-${randomHex(2)}`;
+    const baseSlug = d.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'product';
     const now = new Date().toISOString();
 
     const priceKobo = Math.round(d.priceNaira * 100);
     const salePriceKobo = d.salePriceNaira !== null && d.salePriceNaira !== undefined ? Math.round(d.salePriceNaira * 100) : null;
     const costPriceKobo = d.costPriceNaira !== null && d.costPriceNaira !== undefined ? Math.round(d.costPriceNaira * 100) : null;
 
-    await db.transaction(async (tx) => {
-      await tx.run(
-        `INSERT INTO products (
-          id, name, slug, sku, barcode, brand, short_description, description, specifications_json,
-          category_id, collection_id, price_kobo, sale_price_kobo, cost_price_kobo,
-          track_inventory, low_stock_threshold, status, is_featured, seo_title, seo_description,
-          media_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          productId,
-          d.name.trim(),
-          slug,
-          d.sku.trim(),
-          d.barcode || null,
-          d.brand || 'SELLORA',
-          d.shortDescription || '',
-          d.description || '',
-          JSON.stringify(d.specifications),
-          d.categoryId || null,
-          d.collectionId || null,
-          priceKobo,
-          salePriceKobo,
-          costPriceKobo,
-          d.lowStockThreshold,
-          d.status,
-          d.isFeatured ? 1 : 0,
-          d.seoTitle || null,
-          d.seoDescription || null,
-          JSON.stringify(d.media),
-          now,
-          now,
-        ]
-      );
+    let productSku = '';
+    let variantSku = '';
+    let created = false;
+    let lastError: unknown = null;
 
-      await tx.run(
-        `INSERT INTO product_variants (
-          id, product_id, name, sku, barcode, attributes_json, price_kobo, sale_price_kobo, cost_price_kobo,
-          stock_quantity, reserved_quantity, is_active, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)`,
-        [
-          variantId,
-          productId,
-          d.variantName,
-          d.sku.trim(),
-          d.barcode || null,
-          JSON.stringify({ Variant: d.variantName }),
-          priceKobo,
-          salePriceKobo,
-          costPriceKobo,
-          d.stockQuantity,
-          now,
-        ]
-      );
-    });
+    for (let attempt = 0; attempt < 8; attempt++) {
+      productSku = generateAutoProductSku(d.name);
+      variantSku = generateAutoVariantSku(productSku, 1);
+      const slug = `${baseSlug}-${randomHex(2)}`;
+
+      try {
+        await db.batch([
+          {
+            sql: `INSERT INTO products (
+              id, name, slug, sku, barcode, brand, short_description, description, specifications_json,
+              category_id, collection_id, price_kobo, sale_price_kobo, cost_price_kobo,
+              track_inventory, low_stock_threshold, status, is_featured, seo_title, seo_description,
+              media_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              productId,
+              d.name.trim(),
+              slug,
+              productSku,
+              d.barcode || null,
+              d.brand || 'SELLORA',
+              d.shortDescription || '',
+              d.description || '',
+              JSON.stringify(d.specifications),
+              d.categoryId || null,
+              d.collectionId || null,
+              priceKobo,
+              salePriceKobo,
+              costPriceKobo,
+              d.lowStockThreshold,
+              d.status,
+              d.isFeatured ? 1 : 0,
+              d.seoTitle || null,
+              d.seoDescription || null,
+              JSON.stringify(d.media),
+              now,
+              now,
+            ],
+          },
+          {
+            sql: `INSERT INTO product_variants (
+              id, product_id, name, sku, barcode, attributes_json, price_kobo, sale_price_kobo, cost_price_kobo,
+              stock_quantity, reserved_quantity, is_active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)`,
+            params: [
+              variantId,
+              productId,
+              d.variantName,
+              variantSku,
+              d.barcode || null,
+              JSON.stringify({ Variant: d.variantName }),
+              priceKobo,
+              salePriceKobo,
+              costPriceKobo,
+              d.stockQuantity,
+              now,
+            ],
+          },
+        ]);
+        created = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (isUniqueConstraintError(err)) {
+          continue;
+        }
+        return c.json({ error: 'Unable to create product.' }, 400);
+      }
+    }
+
+    if (!created) {
+      if (isUniqueConstraintError(lastError)) {
+        return c.json({ error: 'Unable to allocate a unique product SKU. Please retry.' }, 409);
+      }
+      return c.json({ error: 'Unable to create product.' }, 400);
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -1126,19 +1296,44 @@ export function createAdminRoutes() {
       action: 'PRODUCT_CREATED',
       targetType: 'product',
       targetId: productId,
-      details: { name: d.name, sku: d.sku },
+      details: { name: d.name, sku: productSku },
     });
 
-    return c.json({ ok: true, id: productId }, 201);
+    return c.json({ ok: true, id: productId, sku: productSku, variantSku }, 201);
   });
 
   app.patch('/products/:id', requirePerm('products:write'), async (c) => {
     const user = c.get('user')!;
     const db = c.get('db');
     const id = c.req.param('id');
-    const body = await c.req.json().catch(() => ({}));
+    const rawBody = await c.req.json().catch(() => ({}));
+    const patchSchema = z.object({
+      name: z.string().min(1).max(160).optional(),
+      shortDescription: z.string().max(400).optional(),
+      description: z.string().max(10000).optional(),
+      categoryId: z.string().max(100).nullable().optional(),
+      collectionId: z.string().max(100).nullable().optional(),
+      priceNaira: z.number().nonnegative().optional(),
+      salePriceNaira: z.number().nonnegative().nullable().optional(),
+      costPriceNaira: z.number().nonnegative().nullable().optional(),
+      lowStockThreshold: z.number().int().min(0).optional(),
+      status: z.enum(['draft', 'active', 'archived']).optional(),
+      isFeatured: z.boolean().optional(),
+      seoTitle: z.string().max(160).nullable().optional(),
+      seoDescription: z.string().max(320).nullable().optional(),
+      seoCanonicalUrl: z.string().max(300).nullable().optional(),
+      seoImageUrl: z.string().max(300).nullable().optional(),
+      imageAlt: z.string().max(200).nullable().optional(),
+      media: z.array(z.string().max(400)).max(20).optional(),
+    });
+    const parsedPatch = patchSchema.safeParse(rawBody);
+    if (!parsedPatch.success) {
+      return c.json({ error: parsedPatch.error.issues[0]?.message || 'Invalid product update' }, 400);
+    }
+    const body = parsedPatch.data;
     const now = new Date().toISOString();
 
+    // SKUs are immutable once generated; ignore any client-supplied sku field
     const priceKobo = body.priceNaira !== undefined ? Math.round(Number(body.priceNaira) * 100) : null;
     const salePriceKobo =
       body.salePriceNaira === null
@@ -1153,55 +1348,68 @@ export function createAdminRoutes() {
           ? Math.round(Number(body.costPriceNaira) * 100)
           : undefined;
 
-    await db.run(
-      `UPDATE products SET
-        name = COALESCE(?, name),
-        short_description = COALESCE(?, short_description),
-        description = COALESCE(?, description),
-        category_id = COALESCE(?, category_id),
-        collection_id = COALESCE(?, collection_id),
-        price_kobo = COALESCE(?, price_kobo),
-        low_stock_threshold = COALESCE(?, low_stock_threshold),
-        status = COALESCE(?, status),
-        is_featured = COALESCE(?, is_featured),
-        seo_title = COALESCE(?, seo_title),
-        seo_description = COALESCE(?, seo_description),
-        seo_canonical_url = COALESCE(?, seo_canonical_url),
-        seo_image_url = COALESCE(?, seo_image_url),
-        image_alt = COALESCE(?, image_alt),
-        media_json = COALESCE(?, media_json),
-        updated_at = ?
-      WHERE id = ?`,
-      [
-        body.name ?? null,
-        body.shortDescription ?? null,
-        body.description ?? null,
-        body.categoryId !== undefined ? body.categoryId : null,
-        body.collectionId !== undefined ? body.collectionId : null,
-        priceKobo,
-        body.lowStockThreshold ?? null,
-        body.status ?? null,
-        body.isFeatured !== undefined ? (body.isFeatured ? 1 : 0) : null,
-        body.seoTitle !== undefined ? body.seoTitle : null,
-        body.seoDescription !== undefined ? body.seoDescription : null,
-        body.seoCanonicalUrl !== undefined ? body.seoCanonicalUrl : null,
-        body.seoImageUrl !== undefined ? body.seoImageUrl : null,
-        body.imageAlt !== undefined ? body.imageAlt : null,
-        body.media ? JSON.stringify(body.media) : null,
-        now,
-        id,
-      ]
-    );
+    const updateBatch: BatchStatement[] = [
+      {
+        sql: `UPDATE products SET
+          name = COALESCE(?, name),
+          short_description = COALESCE(?, short_description),
+          description = COALESCE(?, description),
+          category_id = COALESCE(?, category_id),
+          collection_id = COALESCE(?, collection_id),
+          price_kobo = COALESCE(?, price_kobo),
+          low_stock_threshold = COALESCE(?, low_stock_threshold),
+          status = COALESCE(?, status),
+          is_featured = COALESCE(?, is_featured),
+          seo_title = COALESCE(?, seo_title),
+          seo_description = COALESCE(?, seo_description),
+          seo_canonical_url = COALESCE(?, seo_canonical_url),
+          seo_image_url = COALESCE(?, seo_image_url),
+          image_alt = COALESCE(?, image_alt),
+          media_json = COALESCE(?, media_json),
+          updated_at = ?
+        WHERE id = ?`,
+        params: [
+          body.name !== undefined ? String(body.name).trim() : null,
+          body.shortDescription ?? null,
+          body.description ?? null,
+          body.categoryId !== undefined ? body.categoryId : null,
+          body.collectionId !== undefined ? body.collectionId : null,
+          priceKobo,
+          body.lowStockThreshold ?? null,
+          body.status ?? null,
+          body.isFeatured !== undefined ? (body.isFeatured ? 1 : 0) : null,
+          body.seoTitle !== undefined ? body.seoTitle : null,
+          body.seoDescription !== undefined ? body.seoDescription : null,
+          body.seoCanonicalUrl !== undefined ? body.seoCanonicalUrl : null,
+          body.seoImageUrl !== undefined ? body.seoImageUrl : null,
+          body.imageAlt !== undefined ? body.imageAlt : null,
+          body.media ? JSON.stringify(body.media) : null,
+          now,
+          id,
+        ],
+      },
+    ];
 
     if (salePriceKobo !== undefined) {
-      await db.run(`UPDATE products SET sale_price_kobo = ? WHERE id = ?`, [salePriceKobo, id]);
+      updateBatch.push({
+        sql: `UPDATE products SET sale_price_kobo = ? WHERE id = ?`,
+        params: [salePriceKobo, id],
+      });
     }
     if (costPriceKobo !== undefined) {
-      await db.run(`UPDATE products SET cost_price_kobo = ? WHERE id = ?`, [costPriceKobo, id]);
+      updateBatch.push({
+        sql: `UPDATE products SET cost_price_kobo = ? WHERE id = ?`,
+        params: [costPriceKobo, id],
+      });
     }
     if (priceKobo !== null) {
-      await db.run(`UPDATE product_variants SET price_kobo = ? WHERE product_id = ?`, [priceKobo, id]);
+      updateBatch.push({
+        sql: `UPDATE product_variants SET price_kobo = ? WHERE product_id = ?`,
+        params: [priceKobo, id],
+      });
     }
+
+    await db.batch(updateBatch);
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -1221,55 +1429,84 @@ export function createAdminRoutes() {
     if (!orig) return c.json({ error: 'Product not found' }, 404);
 
     const newId = `prod_${randomUuid()}`;
-    const suffix = randomHex(2).toUpperCase();
+    const newVarId = `var_${randomUuid()}`;
     const now = new Date().toISOString();
+    const copyName = `${orig.name} (Copy)`;
+    let productSku = '';
+    let variantSku = '';
+    let duplicated = false;
 
-    await db.run(
-      `INSERT INTO products (
-        id, name, slug, sku, brand, short_description, description, specifications_json,
-        category_id, collection_id, price_kobo, sale_price_kobo, cost_price_kobo,
-        track_inventory, low_stock_threshold, status, is_featured, media_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, ?, ?, ?)`,
-      [
-        newId,
-        `${orig.name} (Copy)`,
-        `${orig.slug}-${suffix.toLowerCase()}`,
-        `${orig.sku}-${suffix}`,
-        orig.brand,
-        orig.short_description,
-        orig.description,
-        orig.specifications_json,
-        orig.category_id,
-        orig.collection_id,
-        orig.price_kobo,
-        orig.sale_price_kobo,
-        orig.cost_price_kobo,
-        orig.track_inventory,
-        orig.low_stock_threshold,
-        orig.media_json,
-        now,
-        now,
-      ]
-    );
-    await db.run(
-      `INSERT INTO product_variants (id, product_id, name, sku, attributes_json, price_kobo, sale_price_kobo, cost_price_kobo, stock_quantity, reserved_quantity, is_active, created_at)
-       VALUES (?, ?, 'Default', ?, '{}', ?, ?, ?, 0, 0, 1, ?)`,
-      [
-        `var_${randomUuid()}`,
-        newId,
-        `${orig.sku}-${suffix}-V1`,
-        orig.price_kobo,
-        orig.sale_price_kobo,
-        orig.cost_price_kobo,
-        now,
-      ]
-    );
-    return c.json({ ok: true, id: newId }, 201);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      productSku = generateAutoProductSku(String(orig.name || 'Item'));
+      variantSku = generateAutoVariantSku(productSku, 1);
+      const suffix = randomHex(2).toLowerCase();
+
+      try {
+        await db.batch([
+          {
+            sql: `INSERT INTO products (
+              id, name, slug, sku, brand, short_description, description, specifications_json,
+              category_id, collection_id, price_kobo, sale_price_kobo, cost_price_kobo,
+              track_inventory, low_stock_threshold, status, is_featured, media_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, ?, ?, ?)`,
+            params: [
+              newId,
+              copyName,
+              `${orig.slug}-${suffix}`,
+              productSku,
+              orig.brand,
+              orig.short_description,
+              orig.description,
+              orig.specifications_json,
+              orig.category_id,
+              orig.collection_id,
+              orig.price_kobo,
+              orig.sale_price_kobo,
+              orig.cost_price_kobo,
+              orig.track_inventory,
+              orig.low_stock_threshold,
+              orig.media_json,
+              now,
+              now,
+            ],
+          },
+          {
+            sql: `INSERT INTO product_variants (id, product_id, name, sku, attributes_json, price_kobo, sale_price_kobo, cost_price_kobo, stock_quantity, reserved_quantity, is_active, created_at)
+             VALUES (?, ?, 'Default', ?, '{}', ?, ?, ?, 0, 0, 1, ?)`,
+            params: [
+              newVarId,
+              newId,
+              variantSku,
+              orig.price_kobo,
+              orig.sale_price_kobo,
+              orig.cost_price_kobo,
+              now,
+            ],
+          },
+        ]);
+        duplicated = true;
+        break;
+      } catch (err) {
+        if (isUniqueConstraintError(err)) continue;
+        return c.json({ error: 'Unable to duplicate product.' }, 400);
+      }
+    }
+
+    if (!duplicated) {
+      return c.json({ error: 'Unable to allocate a unique SKU for duplicated product.' }, 409);
+    }
+
+    return c.json({ ok: true, id: newId, sku: productSku, variantSku }, 201);
   });
 
   app.delete('/products/:id', requirePerm('products:write'), async (c) => {
     const db = c.get('db');
+    const storage = c.get('storage');
     const id = c.req.param('id');
+    const existing = await db.get<{ media_json: string; seo_image_url: string | null }>(
+      `SELECT media_json, seo_image_url FROM products WHERE id = ?`,
+      [id]
+    );
     const ordered = await db.get<{ cnt: number }>(
       `SELECT COUNT(*) as cnt FROM order_items WHERE product_id = ?`,
       [id]
@@ -1282,6 +1519,57 @@ export function createAdminRoutes() {
       return c.json({ ok: true, archived: true });
     }
     await db.run(`DELETE FROM products WHERE id = ?`, [id]);
+
+    if (existing) {
+      const candidateFiles = new Set<string>();
+      const extractFile = (url: string | null | undefined) => {
+        const m = (url || '').match(/\/api\/media\/products\/([a-zA-Z0-9._-]+)/);
+        if (m && m[1].startsWith('prod_')) candidateFiles.add(m[1]);
+      };
+      extractFile(existing.seo_image_url);
+      try {
+        const list = JSON.parse(existing.media_json || '[]') as string[];
+        for (const u of list) extractFile(u);
+      } catch {
+        // ignore malformed media_json
+      }
+
+      if (candidateFiles.size > 0) {
+        const remainingProds = await db.all<{ media_json: string; seo_image_url: string | null }>(
+          `SELECT media_json, seo_image_url FROM products`
+        );
+        const catRows = await db.all<{ image_url: string | null }>(`SELECT image_url FROM categories`);
+        const colRows = await db.all<{ banner_url: string | null }>(`SELECT banner_url FROM collections`);
+        for (const file of candidateFiles) {
+          const stillUsed =
+            remainingProds.some(
+              (p) => (p.media_json || '').includes(file) || (p.seo_image_url || '').includes(file)
+            ) ||
+            catRows.some((cat) => (cat.image_url || '').includes(file)) ||
+            colRows.some((col) => (col.banner_url || '').includes(file));
+          if (!stillUsed) {
+            const key = `products/${file}`;
+            try {
+              await storage.delete(key);
+            } catch (err) {
+              await db
+                .run(
+                  `INSERT OR IGNORE INTO storage_orphan_records (id, r2_key, prefix, reason, status, created_at)
+                   VALUES (?, ?, 'products', ?, 'pending', ?)`,
+                  [
+                    `orp_${randomUuid()}`,
+                    key,
+                    err instanceof Error ? err.message : 'product_delete_r2_cleanup_failed',
+                    new Date().toISOString(),
+                  ]
+                )
+                .catch(() => {});
+            }
+          }
+        }
+      }
+    }
+
     return c.json({ ok: true, deleted: true });
   });
 
@@ -1363,10 +1651,16 @@ export function createAdminRoutes() {
 
   app.patch('/reviews/:id', requirePerm('products:write'), async (c) => {
     const db = c.get('db');
-    const body = await c.req.json().catch(() => ({}));
+    const rawBody = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      status: z.enum(['pending', 'approved', 'rejected']).optional(),
+      adminReply: z.string().max(1500).optional(),
+    });
+    const parsed = schema.safeParse(rawBody);
+    if (!parsed.success) return c.json({ error: 'Invalid review update payload' }, 400);
     await db.run(`UPDATE reviews SET status = COALESCE(?, status), admin_reply = COALESCE(?, admin_reply) WHERE id = ?`, [
-      body.status ?? null,
-      body.adminReply ?? null,
+      parsed.data.status ?? null,
+      parsed.data.adminReply ?? null,
       c.req.param('id'),
     ]);
     return c.json({ ok: true });
@@ -1406,35 +1700,52 @@ export function createAdminRoutes() {
     if (!parsed.success) return c.json({ error: 'Invalid stock adjustment' }, 400);
 
     try {
-      await db.transaction(async (tx) => {
-        const v = await tx.get<{ id: string; product_id: string; stock_quantity: number }>(
-          `SELECT id, product_id, stock_quantity FROM product_variants WHERE id = ?`,
-          [parsed.data.variantId]
-        );
-        if (!v) throw new Error('Variant not found');
-        const newQty = v.stock_quantity + parsed.data.changeAmount;
-        if (newQty < 0) throw new Error('Stock cannot drop below zero');
-
-        await tx.run(`UPDATE product_variants SET stock_quantity = ? WHERE id = ?`, [newQty, v.id]);
-        await tx.run(
-          `INSERT INTO inventory_movements (id, product_id, variant_id, change_amount, previous_qty, new_qty, reason, reference_type, actor_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'manual_adjustment', ?, ?)`,
-          [
+      const now = new Date().toISOString();
+      await db.batch([
+        {
+          // Scalar subqueries capture live stock_quantity; NULL product_id aborts batch if variant does not exist
+          sql: `INSERT INTO inventory_movements (
+            id, product_id, variant_id, change_amount, previous_qty, new_qty,
+            reason, reference_type, actor_id, created_at
+          ) VALUES (
+            ?,
+            (SELECT product_id FROM product_variants WHERE id = ?),
+            ?,
+            ?,
+            (SELECT stock_quantity FROM product_variants WHERE id = ?),
+            (SELECT stock_quantity + ? FROM product_variants WHERE id = ?),
+            ?, 'manual_adjustment', ?, ?
+          )`,
+          params: [
             `mov_${randomUuid()}`,
-            v.product_id,
-            v.id,
+            parsed.data.variantId,
+            parsed.data.variantId,
             parsed.data.changeAmount,
-            v.stock_quantity,
-            newQty,
+            parsed.data.variantId,
+            parsed.data.changeAmount,
+            parsed.data.variantId,
             parsed.data.reason.trim(),
             user.id,
-            new Date().toISOString(),
-          ]
-        );
-      });
+            now,
+          ],
+        },
+        {
+          // Relative arithmetic preserves concurrent checkouts; trigger/CHECK aborts & rolls back if < 0
+          sql: `UPDATE product_variants SET stock_quantity = stock_quantity + ? WHERE id = ?`,
+          params: [parsed.data.changeAmount, parsed.data.variantId],
+        },
+      ]);
       return c.json({ ok: true });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'Stock adjustment failed' }, 400);
+      const guardCode = extractDbGuardCode(err);
+      const errMsg = err instanceof Error ? err.message : '';
+      if (guardCode === 'INSUFFICIENT_STOCK' || /stock_quantity/i.test(errMsg)) {
+        return c.json({ error: 'Stock cannot drop below zero.' }, 400);
+      }
+      if (/NOT NULL constraint failed: inventory_movements/i.test(errMsg)) {
+        return c.json({ error: 'Variant not found.' }, 404);
+      }
+      return c.json({ error: 'Stock adjustment failed.' }, 400);
     }
   });
 
@@ -1554,7 +1865,19 @@ export function createAdminRoutes() {
 
   app.patch('/delivery-zones/:id', requirePerm('delivery:write'), async (c) => {
     const db = c.get('db');
-    const body = await c.req.json().catch(() => ({}));
+    const rawBody = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      feeNaira: z.number().min(0).optional(),
+      freeThresholdNaira: z.number().min(0).nullable().optional(),
+      estimatedDaysMin: z.number().int().min(1).max(60).optional(),
+      estimatedDaysMax: z.number().int().min(1).max(60).optional(),
+      isEnabled: z.boolean().optional(),
+      instructions: z.string().max(500).optional(),
+      courierName: z.string().max(120).optional(),
+    });
+    const parsed = schema.safeParse(rawBody);
+    if (!parsed.success) return c.json({ error: 'Invalid delivery zone update payload' }, 400);
+    const body = parsed.data;
     await db.run(
       `UPDATE delivery_zones SET
         fee_kobo = COALESCE(?, fee_kobo),
@@ -1612,30 +1935,56 @@ export function createAdminRoutes() {
       discountValue: z.number().positive(),
       minSpendNaira: z.number().min(0).default(0),
       maxUses: z.number().int().positive().nullable().optional(),
+      startsAt: z.string().nullable().optional(),
       expiresAt: z.string().nullable().optional(),
     });
     const parsed = schema.safeParse(body);
     if (!parsed.success) return c.json({ error: 'Invalid coupon data' }, 400);
 
+    const normalizeIsoTimestamp = (raw: string | null | undefined, label: string): { ok: true; value: string | null } | { ok: false; error: string } => {
+      if (!raw || !raw.trim()) return { ok: true, value: null };
+      const parsedDate = new Date(raw.trim());
+      if (Number.isNaN(parsedDate.getTime())) {
+        return { ok: false, error: `Invalid ${label} timestamp format.` };
+      }
+      return { ok: true, value: parsedDate.toISOString() };
+    };
+
     const d = parsed.data;
+    const startsNorm = normalizeIsoTimestamp(d.startsAt, 'startsAt');
+    if (!startsNorm.ok) return c.json({ error: startsNorm.error }, 400);
+    const expiresNorm = normalizeIsoTimestamp(d.expiresAt, 'expiresAt');
+    if (!expiresNorm.ok) return c.json({ error: expiresNorm.error }, 400);
+    if (startsNorm.value && expiresNorm.value && startsNorm.value > expiresNorm.value) {
+      return c.json({ error: 'Coupon start date cannot be later than expiry date.' }, 400);
+    }
+
     const val = d.discountType === 'percentage' ? Math.min(100, Math.round(d.discountValue)) : Math.round(d.discountValue * 100);
     const id = `cpn_${randomUuid()}`;
-    await db.run(
-      `INSERT INTO coupons (id, code, description, discount_type, discount_value, min_spend_kobo, max_uses, expires_at, is_active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-      [
-        id,
-        d.code.trim().toUpperCase(),
-        d.description,
-        d.discountType,
-        val,
-        Math.round(d.minSpendNaira * 100),
-        d.maxUses ?? null,
-        d.expiresAt ?? null,
-        new Date().toISOString(),
-      ]
-    );
-    return c.json({ ok: true, id }, 201);
+    try {
+      await db.run(
+        `INSERT INTO coupons (id, code, description, discount_type, discount_value, min_spend_kobo, max_uses, starts_at, expires_at, is_active, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        [
+          id,
+          d.code.trim().toUpperCase(),
+          d.description,
+          d.discountType,
+          val,
+          Math.round(d.minSpendNaira * 100),
+          d.maxUses ?? null,
+          startsNorm.value,
+          expiresNorm.value,
+          new Date().toISOString(),
+        ]
+      );
+      return c.json({ ok: true, id }, 201);
+    } catch (err) {
+      if (isUniqueConstraintError(err)) {
+        return c.json({ error: 'A discount code with that code already exists.' }, 409);
+      }
+      return c.json({ error: 'Unable to create discount code.' }, 400);
+    }
   });
 
   app.patch('/coupons/:id', requirePerm('marketing:write'), async (c) => {
@@ -1673,97 +2022,196 @@ export function createAdminRoutes() {
     if (!parsed.success) return c.json({ error: 'Invalid POS order' }, 400);
 
     try {
-      const created = await db.transaction(async (tx) => {
-        let subtotalKobo = 0;
-        const orderId = `ord_${randomUuid()}`;
-        const orderNumber = `POS-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randomHex(2).toUpperCase()}`;
-        const now = new Date().toISOString();
-        const itemsResolved: any[] = [];
+      // Aggregate duplicate (productId, variantId) lines for clean atomic POS deduction
+      const mergedItems: Array<{ productId: string; variantId: string; quantity: number }> = [];
+      const itemIndex = new Map<string, number>();
+      for (const reqItem of parsed.data.items) {
+        const key = `${reqItem.productId}::${reqItem.variantId}`;
+        const idx = itemIndex.get(key);
+        if (idx !== undefined) {
+          mergedItems[idx].quantity += reqItem.quantity;
+        } else {
+          itemIndex.set(key, mergedItems.length);
+          mergedItems.push({ ...reqItem });
+        }
+      }
 
-        for (const reqItem of parsed.data.items) {
-          const prod = await tx.get<Record<string, unknown>>(`SELECT * FROM products WHERE id = ?`, [reqItem.productId]);
-          const variant = await tx.get<Record<string, unknown>>(`SELECT * FROM product_variants WHERE id = ?`, [reqItem.variantId]);
-          if (!prod || !variant) throw new Error('Product or variant not found');
+      let subtotalKobo = 0;
+      const orderId = `ord_${randomUuid()}`;
+      const orderNumber = `POS-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randomHex(2).toUpperCase()}`;
+      const now = new Date().toISOString();
+      const itemsResolved: Array<{
+        orderItemId: string;
+        productId: string;
+        variantId: string;
+        productName: string;
+        variantName: string;
+        sku: string;
+        quantity: number;
+        unitPriceKobo: number;
+        costPriceKobo: number | null;
+        lineTotal: number;
+        trackInventory: number;
+      }> = [];
 
-          const dec = await tx.run(
-            `UPDATE product_variants SET stock_quantity = stock_quantity - ? WHERE id = ? AND stock_quantity >= ?`,
-            [reqItem.quantity, variant.id, reqItem.quantity]
-          );
-          if (dec.changes === 0) throw new Error(`Insufficient stock for ${prod.name}`);
+      for (const reqItem of mergedItems) {
+        const prod = await db.get<Record<string, unknown>>(`SELECT * FROM products WHERE id = ?`, [reqItem.productId]);
+        const variant = await db.get<Record<string, unknown>>(
+          `SELECT * FROM product_variants WHERE id = ? AND product_id = ? AND is_active = 1`,
+          [reqItem.variantId, reqItem.productId]
+        );
+        if (!prod || !variant) {
+          return c.json({ error: 'Product or active variant not found' }, 404);
+        }
 
-          const unitPriceKobo = Number(variant.sale_price_kobo ?? variant.price_kobo);
-          const lineTotal = unitPriceKobo * reqItem.quantity;
-          subtotalKobo += lineTotal;
-          itemsResolved.push({
-            orderItemId: `oi_${randomUuid()}`,
-            productId: prod.id,
-            variantId: variant.id,
-            productName: prod.name,
-            variantName: variant.name,
-            sku: variant.sku,
-            quantity: reqItem.quantity,
-            unitPriceKobo,
-            costPriceKobo: variant.cost_price_kobo ?? prod.cost_price_kobo ?? null,
-            lineTotal,
-            prevStock: Number(variant.stock_quantity),
+        const trackInventory = Number(prod.track_inventory) === 1 ? 1 : 0;
+        if (trackInventory && Number(variant.stock_quantity || 0) < reqItem.quantity) {
+          return c.json({ error: `Insufficient stock for ${prod.name}` }, 400);
+        }
+
+        const unitPriceKobo = Number(variant.sale_price_kobo ?? variant.price_kobo);
+        const lineTotal = unitPriceKobo * reqItem.quantity;
+        subtotalKobo += lineTotal;
+        itemsResolved.push({
+          orderItemId: `oi_${randomUuid()}`,
+          productId: String(prod.id),
+          variantId: String(variant.id),
+          productName: String(prod.name),
+          variantName: String(variant.name),
+          sku: String(variant.sku),
+          quantity: reqItem.quantity,
+          unitPriceKobo,
+          costPriceKobo:
+            variant.cost_price_kobo !== null && variant.cost_price_kobo !== undefined
+              ? Number(variant.cost_price_kobo)
+              : prod.cost_price_kobo !== null && prod.cost_price_kobo !== undefined
+                ? Number(prod.cost_price_kobo)
+                : null,
+          lineTotal,
+          trackInventory,
+        });
+      }
+
+      const discountKobo = Math.min(subtotalKobo, Math.round(parsed.data.discountNaira * 100));
+      const totalKobo = subtotalKobo - discountKobo;
+      const payStatus = parsed.data.markPaid ? 'payment_confirmed' : 'pending_payment';
+      const ordStatus = parsed.data.markPaid ? 'delivered' : 'pending_payment';
+
+      const statements: BatchStatement[] = [];
+
+      for (const it of itemsResolved) {
+        if (it.trackInventory) {
+          statements.push({
+            sql: `INSERT INTO inventory_movements (
+              id, product_id, variant_id, change_amount, previous_qty, new_qty,
+              reason, reference_type, reference_id, actor_id, created_at
+            ) VALUES (
+              ?, ?, ?, ?,
+              (SELECT stock_quantity FROM product_variants WHERE id = ? AND product_id = ? AND is_active = 1),
+              (SELECT stock_quantity - ? FROM product_variants WHERE id = ? AND product_id = ? AND is_active = 1),
+              'POS Sale', 'order', ?, ?, ?
+            )`,
+            params: [
+              `mov_${randomUuid()}`,
+              it.productId,
+              it.variantId,
+              -it.quantity,
+              it.variantId,
+              it.productId,
+              it.quantity,
+              it.variantId,
+              it.productId,
+              orderId,
+              user.id,
+              now,
+            ],
+          });
+          statements.push({
+            sql: `UPDATE product_variants SET stock_quantity = stock_quantity - ? WHERE id = ? AND is_active = 1`,
+            params: [it.quantity, it.variantId],
           });
         }
+      }
 
-        const discountKobo = Math.min(subtotalKobo, Math.round(parsed.data.discountNaira * 100));
-        const totalKobo = subtotalKobo - discountKobo;
-        const payStatus = parsed.data.markPaid ? 'payment_confirmed' : 'pending_payment';
-        const ordStatus = parsed.data.markPaid ? 'delivered' : 'pending_payment';
-
-        await tx.run(
-          `INSERT INTO orders (
-            order_id, order_number, customer_name, customer_email, customer_phone,
-            delivery_address_snapshot_json, delivery_fee_kobo, subtotal_kobo, discount_kobo, total_kobo,
-            order_status, payment_status, delivery_status, acknowledged_at, acknowledged_by, needs_attention, source, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pos', ?, ?)`,
-          [
-            orderId,
-            orderNumber,
-            parsed.data.customerName,
-            parsed.data.customerEmail || 'walkin@sellora.local',
-            parsed.data.customerPhone,
-            JSON.stringify({ state: 'In-Store POS', lga: 'In-Store', city: 'In-Store', streetAddress: 'Point of Sale Counter' }),
-            subtotalKobo,
-            discountKobo,
-            totalKobo,
-            ordStatus,
-            payStatus,
-            parsed.data.markPaid ? 'delivered' : 'awaiting_fulfilment',
-            now,
-            user.id,
-            now,
-            now,
-          ]
-        );
-
-        for (const it of itemsResolved) {
-          await tx.run(
-            `INSERT INTO order_items (order_item_id, order_id, product_id, variant_id, product_name, variant_name, sku, quantity, unit_price_kobo, cost_price_kobo, line_total_kobo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [it.orderItemId, orderId, it.productId, it.variantId, it.productName, it.variantName, it.sku, it.quantity, it.unitPriceKobo, it.costPriceKobo, it.lineTotal]
-          );
-          await tx.run(
-            `INSERT INTO inventory_movements (id, product_id, variant_id, change_amount, previous_qty, new_qty, reason, reference_type, reference_id, actor_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'POS Sale', 'order', ?, ?, ?)`,
-            [`mov_${randomUuid()}`, it.productId, it.variantId, -it.quantity, it.prevStock, it.prevStock - it.quantity, orderId, user.id, now]
-          );
-        }
-
-        await tx.run(
-          `INSERT INTO payments (id, order_id, method, expected_amount_kobo, status, verified_by, verified_at, created_at, updated_at)
-           VALUES (?, ?, 'pos_manual', ?, ?, ?, ?, ?, ?)`,
-          [`pay_${randomUuid()}`, orderId, totalKobo, payStatus, parsed.data.markPaid ? user.id : null, parsed.data.markPaid ? now : null, now, now]
-        );
-
-        return { orderId, orderNumber, totalKobo };
+      statements.push({
+        sql: `INSERT INTO orders (
+          order_id, order_number, customer_name, customer_email, customer_phone,
+          delivery_address_snapshot_json, delivery_fee_kobo, subtotal_kobo, discount_kobo, total_kobo,
+          order_status, payment_status, delivery_status, acknowledged_at, acknowledged_by, needs_attention, source, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pos', ?, ?)`,
+        params: [
+          orderId,
+          orderNumber,
+          parsed.data.customerName,
+          parsed.data.customerEmail || 'walkin@sellora.local',
+          parsed.data.customerPhone,
+          JSON.stringify({ state: 'In-Store POS', lga: 'In-Store', city: 'In-Store', streetAddress: 'Point of Sale Counter' }),
+          subtotalKobo,
+          discountKobo,
+          totalKobo,
+          ordStatus,
+          payStatus,
+          parsed.data.markPaid ? 'delivered' : 'awaiting_fulfilment',
+          now,
+          user.id,
+          now,
+          now,
+        ],
       });
-      return c.json({ ok: true, ...created }, 201);
+
+      for (const it of itemsResolved) {
+        statements.push({
+          sql: `INSERT INTO order_items (order_item_id, order_id, product_id, variant_id, product_name, variant_name, sku, quantity, unit_price_kobo, cost_price_kobo, line_total_kobo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            it.orderItemId,
+            orderId,
+            it.productId,
+            it.variantId,
+            it.productName,
+            it.variantName,
+            it.sku,
+            it.quantity,
+            it.unitPriceKobo,
+            it.costPriceKobo,
+            it.lineTotal,
+          ],
+        });
+      }
+
+      statements.push({
+        sql: `INSERT INTO payments (id, order_id, method, expected_amount_kobo, status, verified_by, verified_at, created_at, updated_at)
+              VALUES (?, ?, 'pos_manual', ?, ?, ?, ?, ?, ?)`,
+        params: [
+          `pay_${randomUuid()}`,
+          orderId,
+          totalKobo,
+          payStatus,
+          parsed.data.markPaid ? user.id : null,
+          parsed.data.markPaid ? now : null,
+          now,
+          now,
+        ],
+      });
+
+      statements.push({
+        sql: `INSERT INTO order_status_history (id, order_id, status_field, previous_status, new_status, actor_id, actor_name, note, created_at)
+              VALUES (?, ?, 'order', NULL, ?, ?, ?, 'In-store POS sale recorded.', ?)`,
+        params: [`hist_${randomUuid()}`, orderId, ordStatus, user.id, user.name, now],
+      });
+
+      await db.batch(statements);
+      return c.json({ ok: true, orderId, orderNumber, totalKobo }, 201);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'POS order failed' }, 400);
+      const guardCode = extractDbGuardCode(err);
+      const errMsg = err instanceof Error ? err.message : '';
+      if (guardCode === 'INSUFFICIENT_STOCK' || /stock_quantity/i.test(errMsg)) {
+        return c.json({ error: 'Insufficient stock for one or more POS items.' }, 400);
+      }
+      if (guardCode === 'VARIANT_UNAVAILABLE' || /inventory_movements\.(previous_qty|new_qty)/i.test(errMsg)) {
+        return c.json({ error: 'One or more POS items are no longer available.' }, 400);
+      }
+      return c.json({ error: 'POS order failed.' }, 400);
     }
   });
 
@@ -1798,21 +2246,26 @@ export function createAdminRoutes() {
     const zoneSummary = await db.get<{ enabled_count: number; state_count: number }>(
       `SELECT COUNT(*) as enabled_count, COUNT(DISTINCT state) as state_count FROM delivery_zones WHERE is_enabled = 1`
     );
-    const prodSeoSummary = await db.get<{ total_active: number; with_seo: number }>(
-      `SELECT COUNT(*) as total_active, SUM(CASE WHEN COALESCE(seo_title, '') != '' OR COALESCE(seo_description, '') != '' THEN 1 ELSE 0 END) as with_seo FROM products WHERE status = 'active'`
+
+    const designatedOwnerEmail = (env.ownerEmail || 'olarindevictor046@gmail.com')
+      .trim()
+      .toLowerCase();
+    const emailMigrationPending = Boolean(
+      ownerRecord && ownerRecord.email.trim().toLowerCase() !== designatedOwnerEmail
     );
-    const isEdgeD1 = !db.rawSqlite;
 
     return c.json({
       settings: map,
       emailStatus: {
-        hasBrevoApiKey: effectiveEmail.hasApiKey,
+        notificationServiceReady: Boolean(effectiveEmail.hasApiKey && effectiveEmail.fromEmail),
+        hasSenderCredentials: effectiveEmail.hasApiKey,
         resolvedFromEmail: effectiveEmail.fromEmail,
         resolvedAdminEmail: effectiveEmail.adminNotificationEmail,
       },
       ownerSummary: {
-        designatedOwnerEmail: env.ownerEmail || 'olarindevictor3@gmail.com',
+        designatedOwnerEmail,
         ownerExists: Boolean(ownerRecord),
+        emailMigrationPending,
         ownerRecord,
         googleOAuthConfigured: Boolean(env.googleClientId && env.googleClientSecret),
         authMethods: ['google', 'email_password'],
@@ -1821,97 +2274,6 @@ export function createAdminRoutes() {
         enabledZones: Number(zoneSummary?.enabled_count || 0),
         coveredStates: Number(zoneSummary?.state_count || 0),
       },
-      seoSummary: {
-        activeProducts: Number(prodSeoSummary?.total_active || 0),
-        productsWithSeo: Number(prodSeoSummary?.with_seo || 0),
-        indexingEnabled: effectiveSeo.indexingEnabled,
-        searchConsoleConfigured: Boolean(effectiveSeo.googleSiteVerification),
-        sitemapUrl: '/sitemap.xml',
-        robotsUrl: '/robots.txt',
-      },
-      integrationStatus: [
-        {
-          id: 'google_oauth',
-          name: 'Google OAuth (Better Auth)',
-          status:
-            env.googleClientId && env.googleClientSecret ? 'connected' : 'awaiting_credentials',
-          detail:
-            env.googleClientId && env.googleClientSecret
-              ? 'Client ID and Secret active on server.'
-              : 'Awaiting GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.',
-        },
-        {
-          id: 'google_analytics',
-          name: 'Google Analytics 4 (GA4)',
-          status: effectiveSeo.gaMeasurementId ? 'connected' : 'not_configured',
-          detail: effectiveSeo.gaMeasurementId
-            ? `Measurement ID ${effectiveSeo.gaMeasurementId} active.`
-            : 'Optional: set VITE_GA_MEASUREMENT_ID or enter a valid Measurement ID in Analytics settings.',
-        },
-        {
-          id: 'google_search_console',
-          name: 'Google Search Console',
-          status: effectiveSeo.googleSiteVerification ? 'connected' : 'not_configured',
-          detail: effectiveSeo.googleSiteVerification
-            ? 'HTML meta verification token injected into public <head>.'
-            : 'Optional: enter verification meta token in SEO Settings or GOOGLE_SITE_VERIFICATION.',
-        },
-        {
-          id: 'brevo',
-          name: 'Brevo Transactional Email',
-          status:
-            effectiveEmail.hasApiKey && effectiveEmail.fromEmail
-              ? 'connected'
-              : effectiveEmail.hasApiKey
-                ? 'awaiting_credentials'
-                : 'not_configured',
-          detail: effectiveEmail.hasApiKey
-            ? effectiveEmail.fromEmail
-              ? `Sender ${effectiveEmail.fromEmail} active.`
-              : 'BREVO_API_KEY set; configure BREVO_FROM_EMAIL (verified sender).'
-            : 'Awaiting BREVO_API_KEY in server environment.',
-        },
-        {
-          id: 'cloudflare_workers',
-          name: 'Cloudflare Workers Runtime',
-          status: isEdgeD1 ? 'connected' : 'awaiting_credentials',
-          detail: isEdgeD1
-            ? 'Running on Cloudflare Workers edge runtime.'
-            : 'Edge worker/index.ts ready; currently running on local Node dev server.',
-        },
-        {
-          id: 'cloudflare_d1',
-          name: 'Cloudflare D1 Database',
-          status: isEdgeD1 ? 'connected' : 'awaiting_credentials',
-          detail: isEdgeD1
-            ? 'Connected to D1 DB binding.'
-            : 'Production D1 binding active in worker/index.ts; local Node preview runs on embedded .data/sellora.db without requiring SQLITE_DB_PATH.',
-        },
-        {
-          id: 'cloudflare_r2',
-          name: 'Cloudflare R2 Storage',
-          status: isEdgeD1 ? 'connected' : 'awaiting_credentials',
-          detail: isEdgeD1
-            ? 'Connected to R2_MEDIA bucket.'
-            : 'R2 adapter wired for Workers; dev server using local .data/r2 fallback.',
-        },
-        {
-          id: 'turnstile',
-          name: 'Cloudflare Turnstile (Optional)',
-          status:
-            env.turnstileSecretKey?.trim() && env.turnstileSiteKey?.trim()
-              ? 'connected'
-              : 'not_configured',
-          detail:
-            env.turnstileSecretKey?.trim() && env.turnstileSiteKey?.trim()
-              ? 'Both site key and server secret active; widget and verification enforced.'
-              : env.turnstileSecretKey?.trim() && !env.turnstileSiteKey?.trim()
-                ? 'TURNSTILE_SECRET_KEY set; disabled gracefully until VITE_TURNSTILE_SITE_KEY is also configured.'
-                : !env.turnstileSecretKey?.trim() && env.turnstileSiteKey?.trim()
-                  ? 'VITE_TURNSTILE_SITE_KEY set; disabled gracefully until TURNSTILE_SECRET_KEY is also configured.'
-                  : 'Optional bot protection disabled (set both TURNSTILE_SECRET_KEY and VITE_TURNSTILE_SITE_KEY before public launch).',
-        },
-      ],
     });
   });
 
@@ -1934,7 +2296,19 @@ export function createAdminRoutes() {
         403
       );
     }
-    const body = await c.req.json().catch(() => ({}));
+    if (key === 'bank_transfer' || key === 'email') {
+      const recent = await requireRecentAuthSession(db, c.req.raw.headers);
+      if (!recent) {
+        return c.json(
+          { error: 'Please sign in again before changing payout or email settings.' },
+          403
+        );
+      }
+    }
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return c.json({ error: 'Invalid settings payload' }, 400);
+    }
     const now = new Date().toISOString();
     await db.run(
       `INSERT INTO store_settings (key, value_json, updated_at, updated_by)
@@ -1981,10 +2355,10 @@ export function createAdminRoutes() {
     }
 
     const html = renderSelloraEmailHtml({
-      title: 'SELLORA Test Transactional Email',
+      title: 'SELLORA Test Notification',
       greeting: `Hello ${user.name},`,
       intro:
-        'This is a manual test email triggered from Admin Dashboard -> Settings -> Email & Notifications to verify Brevo API connectivity.',
+        'This is a manual test email triggered from the Store Console under Order Notifications to verify email delivery.',
       detailsRows: [
         { label: 'Triggered By', value: user.email },
         { label: 'Sender Name', value: effective.fromName },
@@ -2181,9 +2555,425 @@ export function createAdminRoutes() {
   });
 
   app.get('/audit-logs', requirePerm('audit:read'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can view security audit logs.' }, 403);
+    }
     const db = c.get('db');
     const logs = await db.all(`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 150`);
     return c.json({ logs });
+  });
+
+  // Safe R2 / local storage orphan reconciliation (retries pending deletes and optionally scans expired unreferenced keys)
+  app.post('/storage/cleanup-orphans', requirePerm('settings:write'), async (c) => {
+    const actor = c.get('user')!;
+    const db = c.get('db');
+    const storage = c.get('storage');
+    const body = await c.req.json().catch(() => ({}));
+    const dryRun = body.dryRun !== false;
+    const includePrefixScan = body.includePrefixScan === true;
+    const graceHours = Math.max(1, Number(body.graceHours ?? 24));
+    const cutoffIso = new Date(Date.now() - graceHours * 3_600_000).toISOString();
+
+    const pendingRows = await db.all<{ id: string; r2_key: string; prefix: string; reason: string }>(
+      `SELECT id, r2_key, prefix, reason FROM storage_orphan_records WHERE status = 'pending' ORDER BY created_at ASC LIMIT 100`
+    );
+
+    const resolvedPending: string[] = [];
+    const failedPending: string[] = [];
+
+    if (!dryRun) {
+      for (const row of pendingRows) {
+        try {
+          await storage.delete(row.r2_key);
+          await db.run(
+            `UPDATE storage_orphan_records SET status = 'deleted', resolved_at = ? WHERE id = ?`,
+            [new Date().toISOString(), row.id]
+          );
+          resolvedPending.push(row.r2_key);
+        } catch {
+          failedPending.push(row.r2_key);
+        }
+      }
+    }
+
+    const scannedOrphans: string[] = [];
+    const deletedScanned: string[] = [];
+    if (includePrefixScan && storage.list) {
+      const receiptObjects = await storage.list('receipts/');
+      if (receiptObjects.length > 0) {
+        const evidenceRows = await db.all<{ receipt_r2_key: string }>(
+          `SELECT receipt_r2_key FROM payment_evidence`
+        );
+        const referencedReceipts = new Set(evidenceRows.map((r) => r.receipt_r2_key));
+        for (const obj of receiptObjects) {
+          if (!referencedReceipts.has(obj.key) && obj.uploadedAt < cutoffIso) {
+            scannedOrphans.push(obj.key);
+            if (!dryRun) {
+              try {
+                await storage.delete(obj.key);
+                deletedScanned.push(obj.key);
+              } catch {
+                // leave for retry
+              }
+            }
+          }
+        }
+      }
+
+      const productObjects = await storage.list('products/');
+      if (productObjects.length > 0) {
+        const productRows = await db.all<{ media_json: string; seo_image_url: string | null }>(
+          `SELECT media_json, seo_image_url FROM products`
+        );
+        const catRows = await db.all<{ image_url: string | null }>(`SELECT image_url FROM categories`);
+        const colRows = await db.all<{ banner_url: string | null }>(`SELECT banner_url FROM collections`);
+        const referencedMedia = new Set<string>();
+        const addUrlRef = (url: string | null | undefined) => {
+          if (!url) return;
+          const m = url.match(/\/api\/media\/products\/([^/?#]+)/);
+          if (m) referencedMedia.add(`products/${m[1]}`);
+          if (url.startsWith('products/')) referencedMedia.add(url);
+        };
+        for (const p of productRows) {
+          addUrlRef(p.seo_image_url);
+          try {
+            const list = JSON.parse(p.media_json || '[]') as string[];
+            for (const u of list) addUrlRef(u);
+          } catch {
+            // ignore
+          }
+        }
+        for (const cat of catRows) addUrlRef(cat.image_url);
+        for (const col of colRows) addUrlRef(col.banner_url);
+
+        for (const obj of productObjects) {
+          if (!referencedMedia.has(obj.key) && obj.uploadedAt < cutoffIso) {
+            scannedOrphans.push(obj.key);
+            if (!dryRun) {
+              try {
+                await storage.delete(obj.key);
+                deletedScanned.push(obj.key);
+              } catch {
+                // leave for retry
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!dryRun) {
+      await writeAuditLog(db, {
+        actorId: actor.id,
+        actorEmail: actor.email,
+        actorRole: actor.role,
+        action: 'STORAGE_ORPHANS_CLEANED',
+        targetType: 'storage',
+        details: {
+          resolvedPendingCount: resolvedPending.length,
+          deletedScannedCount: deletedScanned.length,
+        },
+      });
+    }
+
+    return c.json({
+      ok: true,
+      dryRun,
+      pendingCount: pendingRows.length,
+      pendingKeys: pendingRows.map((r) => r.r2_key),
+      resolvedPending,
+      failedPending,
+      scannedOrphans,
+      deletedScanned,
+    });
+  });
+
+  // ==========================================
+  // OWNER SECURITY ALERTS & CLIENT-AUTHORIZED DEVELOPER INTEGRATIONS
+  // ==========================================
+  app.get('/security-summary', requirePerm('audit:read'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can view security summaries.' }, 403);
+    }
+    const db = c.get('db');
+    const events = await db.all(
+      `SELECT id, event_ref, email, event_category, severity, approx_location, device_summary,
+              risk_level, status, created_at, resolved_at
+       FROM security_events ORDER BY created_at DESC LIMIT 30`
+    );
+    const logins = await db.all(
+      `SELECT id, email, auth_method, outcome, is_new_device, is_unusual, device_summary,
+              approx_location, created_at
+       FROM login_history ORDER BY created_at DESC LIMIT 30`
+    );
+    return c.json({ events, logins });
+  });
+
+  app.get('/infrastructure-status', requirePerm('settings:write'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can view infrastructure status.' }, 403);
+    }
+    const db = c.get('db');
+    const storage = c.get('storage');
+    const env = c.get('env');
+    await db.get('SELECT 1 as ok');
+    const migrationRows = await db
+      .all<{ version: string }>(`SELECT version FROM schema_migrations ORDER BY version ASC`)
+      .catch(() => []);
+    const isWorker = env.runtime === 'worker';
+    const hasStorage = Boolean(storage && typeof storage.get === 'function');
+    return c.json({
+      ok: hasStorage,
+      runtime: isWorker ? 'cloudflare-worker' : 'node-local-dev',
+      environment: env.environment || (isWorker ? 'production' : 'local-development'),
+      database: isWorker ? 'cloudflare-d1' : 'local-sqlite-dev',
+      storage: !hasStorage ? 'unconfigured' : isWorker ? 'cloudflare-r2' : 'local-fs-dev',
+      migrationsApplied: migrationRows.map((row) => row.version),
+    });
+  });
+
+  app.get('/developer-integrations', requirePerm('staff:manage'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can view developer access keys.' }, 403);
+    }
+    const db = c.get('db');
+    const integrations = await db.all<{
+      id: string;
+      portal_name: string;
+      key_prefix: string;
+      scopes_json: string;
+      is_active: number;
+      last_used_at: string | null;
+      expires_at: string | null;
+      revoked_at: string | null;
+      created_at: string;
+    }>(
+      `SELECT id, portal_name, key_prefix, scopes_json, is_active, last_used_at, expires_at, revoked_at, created_at
+       FROM developer_integrations ORDER BY created_at DESC`
+    );
+    return c.json({
+      integrations: integrations.map((i) => ({
+        ...i,
+        scopes: (() => {
+          try {
+            return JSON.parse(i.scopes_json || '[]');
+          } catch {
+            return [];
+          }
+        })(),
+      })),
+    });
+  });
+
+  app.post('/developer-integrations', requirePerm('staff:manage'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can authorize developer access.' }, 403);
+    }
+    const db = c.get('db');
+    const recent = await requireRecentAuthSession(db, c.req.raw.headers);
+    if (!recent) {
+      return c.json(
+        { error: 'Please sign in again before generating a developer integration key.' },
+        403
+      );
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      portalName: z.string().min(2).max(80).default('Authorized Support Portal'),
+      scopes: z
+        .array(z.enum(['errors:read', 'errors:update', 'security:read', 'security:update', 'audit:read']))
+        .min(1)
+        .default(['errors:read', 'errors:update', 'security:read', 'audit:read']),
+      expiresInDays: z.number().int().min(1).max(365).nullable().optional(),
+    });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid integration request' }, 400);
+    }
+
+    const id = `dint_${randomUuid()}`;
+    const rawKey = `slr_dev_${randomHex(24)}`;
+    const keyHash = await sha256Hex(rawKey);
+    const keyPrefix = rawKey.slice(0, 14);
+    const now = new Date().toISOString();
+    const expiresAt = parsed.data.expiresInDays
+      ? new Date(Date.now() + parsed.data.expiresInDays * 86_400_000).toISOString()
+      : null;
+
+    await db.run(
+      `INSERT INTO developer_integrations (
+        id, portal_name, key_prefix, api_key_hash, scopes_json, is_active, created_by, expires_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+      [
+        id,
+        parsed.data.portalName.trim(),
+        keyPrefix,
+        keyHash,
+        JSON.stringify(parsed.data.scopes),
+        actor.id,
+        expiresAt,
+        now,
+      ]
+    );
+
+    await recordSecurityEvent(db, {
+      userId: actor.id,
+      email: actor.email,
+      eventCategory: 'developer_integration_created',
+      severity: 'high',
+      riskLevel: 'medium',
+      status: 'resolved',
+      metadata: { integrationId: id, portalName: parsed.data.portalName, scopes: parsed.data.scopes },
+    });
+
+    await writeAuditLog(db, {
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      action: 'DEVELOPER_INTEGRATION_CREATED',
+      targetType: 'developer_integration',
+      targetId: id,
+      details: { portalName: parsed.data.portalName, scopes: parsed.data.scopes },
+    });
+
+    return c.json(
+      {
+        ok: true,
+        id,
+        apiKey: rawKey,
+        keyPrefix,
+        scopes: parsed.data.scopes,
+        expiresAt,
+      },
+      201
+    );
+  });
+
+  app.delete('/developer-integrations/:id', requirePerm('staff:manage'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can revoke developer access.' }, 403);
+    }
+    const db = c.get('db');
+    const id = c.req.param('id');
+    const now = new Date().toISOString();
+    const res = await db.run(
+      `UPDATE developer_integrations SET is_active = 0, revoked_by = ?, revoked_at = ? WHERE id = ? AND is_active = 1`,
+      [actor.id, now, id]
+    );
+    if (res.changes === 0) {
+      return c.json({ error: 'Active integration not found' }, 404);
+    }
+
+    await recordSecurityEvent(db, {
+      userId: actor.id,
+      email: actor.email,
+      eventCategory: 'developer_integration_revoked',
+      severity: 'medium',
+      riskLevel: 'low',
+      status: 'resolved',
+      metadata: { integrationId: id },
+    });
+
+    await writeAuditLog(db, {
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      action: 'DEVELOPER_INTEGRATION_REVOKED',
+      targetType: 'developer_integration',
+      targetId: id,
+    });
+
+    return c.json({ ok: true });
+  });
+
+  // Owner-only Verified Login Email Change (preserves owner account ID, permissions & history)
+  app.post('/owner/change-email', requirePerm('staff:manage'), async (c) => {
+    const actor = c.get('user')!;
+    if (actor.role !== 'owner') {
+      return c.json({ error: 'Only the store owner can change the administrator login email.' }, 403);
+    }
+
+    const db = c.get('db');
+    const auth = c.get('auth');
+    const recent = await requireRecentAuthSession(db, c.req.raw.headers);
+    if (!recent) {
+      return c.json(
+        { error: 'Please sign in again before changing the administrator login email.' },
+        403
+      );
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      newEmail: z.string().email().max(160),
+    });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Enter a valid email address.' }, 400);
+    }
+
+    const newEmail = parsed.data.newEmail.trim().toLowerCase();
+    if (newEmail === actor.email.trim().toLowerCase()) {
+      return c.json({ error: 'New email must be different from your current login email.' }, 400);
+    }
+
+    const duplicate = await db.get<{ id: string }>(
+      `SELECT id FROM user WHERE LOWER(email) = ? AND id != ?`,
+      [newEmail, actor.id]
+    );
+    if (duplicate) {
+      return c.json({ error: 'An account with that email address already exists.' }, 409);
+    }
+
+    try {
+      await auth.api.changeEmail({
+        body: {
+          newEmail,
+          callbackURL: '/?view=admin&tab=settings',
+        },
+        headers: c.req.raw.headers,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to initiate verified email change.';
+      return c.json({ error: msg }, 400);
+    }
+
+    await writeAuditLog(db, {
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      action: 'OWNER_EMAIL_CHANGE_REQUESTED',
+      targetType: 'user',
+      targetId: actor.id,
+      details: { targetEmail: newEmail, verificationRequired: true },
+    });
+
+    await recordSecurityEvent(db, {
+      userId: actor.id,
+      email: actor.email,
+      eventCategory: 'owner_email_change_requested',
+      severity: 'high',
+      riskLevel: 'medium',
+      status: 'recorded',
+      metadata: { targetEmail: newEmail },
+    });
+
+    return c.json({
+      ok: true,
+      verificationRequired: true,
+      currentEmail: actor.email,
+      targetEmail: newEmail,
+      message: actor.emailVerified
+        ? 'Confirmation link sent to your current login email. After confirming, verify the new email link to finalize the change.'
+        : 'Verification link sent to the new login email. Complete verification to finalize the change.',
+    });
   });
 
   return app;

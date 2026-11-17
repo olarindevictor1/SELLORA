@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { apiFetch, getApiBaseUrl, resolveApiUrl } from '../lib/api';
 import { SelloraLogo } from './SelloraLogo';
 import { TurnstileWidget } from './TurnstileWidget';
 
@@ -76,7 +76,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setNotice(null);
 
     if (turnstileSiteKey && mode !== 'reset' && !turnstileToken) {
-      setError('Please complete the Cloudflare Turnstile security verification check.');
+      setError('Please complete the security verification check.');
       return;
     }
 
@@ -123,7 +123,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           }),
         });
         setNotice(
-          'If an account exists for that email, a password reset link has been queued via Brevo.'
+          'If an account exists for that email, a password reset link has been sent.'
         );
         resetTurnstile();
       } else if (mode === 'reset') {
@@ -167,9 +167,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
     })();
 
-    const callbackURL = isIframe
-      ? `${window.location.origin}/api/auth/complete`
-      : window.location.origin + window.location.pathname;
+    const hasExternalApiBase = Boolean(getApiBaseUrl());
+    const callbackURL = hasExternalApiBase
+      ? resolveApiUrl('/api/auth/complete')
+      : isIframe
+        ? `${window.location.origin}/api/auth/complete`
+        : window.location.origin + window.location.pathname;
 
     try {
       const res = await apiFetch<{ url?: string }>('/api/auth/sign-in/social', {
@@ -437,11 +440,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </button>
           )}
 
-          {(mode === 'signin' || mode === 'signup') && (
+          {(mode === 'signin' || mode === 'signup') && googleOAuthEnabled && (
             <div className="mt-5 pt-4 border-t border-slate-200 space-y-2">
               <button
                 type="button"
-                disabled={!googleOAuthEnabled || googleLoading}
+                disabled={googleLoading}
                 onClick={() => handleGoogle()}
                 className="w-full inline-flex items-center justify-center gap-2.5 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-xs font-semibold text-[#1E293B] hover:bg-[#F5F7F4] disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
               >
@@ -450,12 +453,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   {googleLoading ? 'Connecting to Google...' : 'Continue with Google'}
                 </span>
               </button>
-              {!googleOAuthEnabled && (
-                <p className="text-[11px] text-center text-slate-500 leading-snug">
-                  Google authentication is integrated and awaiting{' '}
-                  <code>GOOGLE_CLIENT_ID</code> &amp; <code>GOOGLE_CLIENT_SECRET</code>.
-                </p>
-              )}
             </div>
           )}
         </div>

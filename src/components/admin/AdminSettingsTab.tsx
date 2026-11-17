@@ -1,37 +1,41 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
-  BarChart3,
   Building2,
-  Globe,
+  KeyRound,
   Landmark,
   Mail,
-  Palette,
-  Plug,
   RefreshCw,
   Send,
   Shield,
-  Truck,
+  ShieldAlert,
 } from 'lucide-react';
 import { apiFetch } from '../../lib/api';
 import { formatLagosDate } from '../../shared/types';
 
-type SettingsSection =
-  | 'profile'
-  | 'staff'
-  | 'payments'
-  | 'delivery'
-  | 'email'
-  | 'seo'
-  | 'analytics'
-  | 'integrations'
-  | 'appearance';
+type SettingsSection = 'profile' | 'staff' | 'payments' | 'security';
+
+function sanitizeNotificationError(raw?: string | null): string {
+  if (!raw) return '';
+  if (/api[_ -]?key/i.test(raw) || /credentials are not configured/i.test(raw)) {
+    return 'Notification service credentials are not configured.';
+  }
+  if (/from[_ -]?email|sender email/i.test(raw)) {
+    return 'Verified sender email address is not configured.';
+  }
+  if (/brevo/i.test(raw)) {
+    return 'Email delivery could not be completed by the mail service.';
+  }
+  return raw;
+}
 
 export const AdminSettingsTab: React.FC<{
   mode: 'email' | 'theme' | 'settings';
   capabilities: any;
+  user?: any;
   onRefreshStorefront: () => Promise<void>;
-}> = ({ mode, capabilities, onRefreshStorefront }) => {
+}> = ({ mode, user, onRefreshStorefront }) => {
+  const isOwner = user?.role === 'owner';
   const [section, setSection] = useState<SettingsSection>('profile');
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -39,26 +43,29 @@ export const AdminSettingsTab: React.FC<{
   // Settings objects
   const [bank, setBank] = useState<any>({});
   const [theme, setTheme] = useState<any>({});
-  const [seo, setSeo] = useState<any>({});
   const [emailCfg, setEmailCfg] = useState<any>({});
   const [emailStatus, setEmailStatus] = useState<any>({});
   const [ownerSummary, setOwnerSummary] = useState<any>({});
-  const [deliverySummary, setDeliverySummary] = useState<any>({});
-  const [seoSummary, setSeoSummary] = useState<any>({});
-  const [integrationStatus, setIntegrationStatus] = useState<any[]>([]);
   const [emailHistory, setEmailHistory] = useState<any[]>([]);
   const [testRecipient, setTestRecipient] = useState('');
 
-  // Staff, Sessions & Audit
+  // Staff, Sessions, Security Alerts & Developer Integrations
   const [staff, setStaff] = useState<any[]>([]);
   const [staffForbidden, setStaffForbidden] = useState(false);
   const [sessions, setSessions] = useState<any[]>([]);
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [auditForbidden, setAuditForbidden] = useState(false);
+  const [securityEvents, setSecurityEvents] = useState<any[]>([]);
+  const [loginHistory, setLoginHistory] = useState<any[]>([]);
+  const [integrations, setIntegrations] = useState<any[]>([]);
+  const [portalName, setPortalName] = useState('Authorized Support Team');
+  const [createdIntegrationKey, setCreatedIntegrationKey] = useState<string | null>(null);
   const [newStaffName, setNewStaffName] = useState('');
   const [newStaffEmail, setNewStaffEmail] = useState('');
   const [newStaffPwd, setNewStaffPwd] = useState('');
   const [newStaffRole, setNewStaffRole] = useState('staff');
+  const [newOwnerEmail, setNewOwnerEmail] = useState('olarindevictor046@gmail.com');
+  const [ownerEmailBusy, setOwnerEmailBusy] = useState(false);
 
   const load = async () => {
     setErr(null);
@@ -66,42 +73,48 @@ export const AdminSettingsTab: React.FC<{
       const sRes = await apiFetch<any>('/api/admin/settings');
       setBank(sRes.settings?.bank_transfer || {});
       setTheme(sRes.settings?.theme || {});
-      setSeo(sRes.settings?.seo || {});
       setEmailCfg(sRes.settings?.email || {});
       setEmailStatus(sRes.emailStatus || {});
       setOwnerSummary(sRes.ownerSummary || {});
-      setDeliverySummary(sRes.deliverySummary || {});
-      setSeoSummary(sRes.seoSummary || {});
-      setIntegrationStatus(sRes.integrationStatus || []);
 
-      if (mode === 'email' || section === 'email') {
+      if (mode === 'email') {
         try {
           const eRes = await apiFetch<any>('/api/admin/email/history');
           setEmailHistory(eRes.events || []);
-          setTestRecipient(eRes.config?.testEmailRecipient || 'olarindevictor3@gmail.com');
+          setTestRecipient(eRes.config?.testEmailRecipient || 'olarindevictor046@gmail.com');
         } catch {
           // non-owner/email roles won't fetch history
         }
       }
 
       if (mode === 'settings') {
-        try {
-          const [stRes, sessRes] = await Promise.all([
-            apiFetch<any>('/api/admin/staff'),
-            apiFetch<any>('/api/admin/sessions').catch(() => ({ sessions: [] })),
-          ]);
-          setStaff(stRes.staff || []);
-          setSessions(sessRes.sessions || []);
-          setStaffForbidden(false);
-        } catch {
+        if (!isOwner) {
           setStaffForbidden(true);
-        }
-        try {
-          const audRes = await apiFetch<any>('/api/admin/audit-logs');
-          setAuditLogs(audRes.logs || []);
-          setAuditForbidden(false);
-        } catch {
           setAuditForbidden(true);
+        } else {
+          try {
+            const [stRes, sessRes, secRes, intRes] = await Promise.all([
+              apiFetch<any>('/api/admin/staff'),
+              apiFetch<any>('/api/admin/sessions').catch(() => ({ sessions: [] })),
+              apiFetch<any>('/api/admin/security-summary').catch(() => ({ events: [], logins: [] })),
+              apiFetch<any>('/api/admin/developer-integrations').catch(() => ({ integrations: [] })),
+            ]);
+            setStaff(stRes.staff || []);
+            setSessions(sessRes.sessions || []);
+            setSecurityEvents(secRes.events || []);
+            setLoginHistory(secRes.logins || []);
+            setIntegrations(intRes.integrations || []);
+            setStaffForbidden(false);
+          } catch {
+            setStaffForbidden(true);
+          }
+          try {
+            const audRes = await apiFetch<any>('/api/admin/audit-logs');
+            setAuditLogs(audRes.logs || []);
+            setAuditForbidden(false);
+          } catch {
+            setAuditForbidden(true);
+          }
         }
       }
     } catch (e: any) {
@@ -111,7 +124,7 @@ export const AdminSettingsTab: React.FC<{
 
   useEffect(() => {
     load();
-  }, [mode, section]);
+  }, [mode, section, isOwner]);
 
   const saveSetting = async (key: string, payload: any) => {
     setMsg(null);
@@ -133,16 +146,14 @@ export const AdminSettingsTab: React.FC<{
     setMsg(null);
     setErr(null);
     try {
-      const res = await apiFetch<any>('/api/admin/email/test', {
+      await apiFetch<any>('/api/admin/email/test', {
         method: 'POST',
         body: JSON.stringify({ recipient: testRecipient }),
       });
-      setMsg(
-        `Test email accepted by Brevo (Message ID: ${res.messageId || 'recorded'}). Note: Provider acceptance is recorded separately from delivery confirmation.`
-      );
+      setMsg('Test notification accepted for delivery.');
       await load();
     } catch (e: any) {
-      setErr(e.message);
+      setErr(sanitizeNotificationError(e.message));
       await load();
     }
   };
@@ -181,6 +192,74 @@ export const AdminSettingsTab: React.FC<{
     await load();
   };
 
+  const revokeMyOtherSessions = async () => {
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ revokedCount: number }>('/api/me/sessions/revoke-others', {
+        method: 'POST',
+      });
+      setMsg(
+        res.revokedCount > 0
+          ? `Signed out ${res.revokedCount} other session(s) for your account.`
+          : 'No other active sessions found for your account.'
+      );
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const createIntegrationAccess = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ apiKey: string }>('/api/admin/developer-integrations', {
+        method: 'POST',
+        body: JSON.stringify({
+          portalName,
+          scopes: ['errors:read', 'errors:update', 'security:read', 'audit:read'],
+          expiresInDays: 90,
+        }),
+      });
+      setCreatedIntegrationKey(res.apiKey);
+      setMsg('Technical support integration key generated. Copy it once now — it will not be shown again.');
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const revokeIntegrationAccess = async (id: string) => {
+    setErr(null);
+    await apiFetch(`/api/admin/developer-integrations/${id}`, { method: 'DELETE' });
+    setMsg('Technical support integration key revoked immediately.');
+    await load();
+  };
+
+  const requestOwnerEmailChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg(null);
+    setErr(null);
+    setOwnerEmailBusy(true);
+    try {
+      const res = await apiFetch<{ message?: string }>('/api/admin/owner/change-email', {
+        method: 'POST',
+        body: JSON.stringify({ newEmail: newOwnerEmail }),
+      });
+      setMsg(
+        res.message ||
+          'Verification steps initiated. Confirm via your current email first, then verify the new login email.'
+      );
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setOwnerEmailBusy(false);
+    }
+  };
+
   const uploadBrandAsset = async (file: File, targetField: 'logoUrl' | 'faviconUrl' | 'heroImage') => {
     const form = new FormData();
     form.append('file', file);
@@ -197,17 +276,19 @@ export const AdminSettingsTab: React.FC<{
       <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-lg font-bold text-[#172554]">
-              Email & Notifications (Brevo Transactional API)
-            </h2>
+            <h2 className="text-lg font-bold text-[#172554]">Order Notifications</h2>
             <p className="text-xs text-slate-500">
-              Default admin alert recipient:{' '}
+              Admin alert recipient:{' '}
               <strong className="text-[#172554]">
-                {emailStatus.resolvedAdminEmail || 'olarindevictor3@gmail.com'}
+                {emailStatus.resolvedAdminEmail || 'olarindevictor046@gmail.com'}
               </strong>{' '}
-              · API Key status:{' '}
-              <strong className={emailStatus.hasBrevoApiKey ? 'text-emerald-700' : 'text-[#9A2E1E]'}>
-                {emailStatus.hasBrevoApiKey ? 'BREVO_API_KEY Configured' : 'BREVO_API_KEY Missing in Server Env'}
+              · Notification service:{' '}
+              <strong className={emailStatus.notificationServiceReady ? 'text-emerald-700' : 'text-[#9A2E1E]'}>
+                {emailStatus.notificationServiceReady
+                  ? 'Connected'
+                  : emailStatus.hasSenderCredentials
+                    ? 'Sender Email Needed'
+                    : 'Needs Setup'}
               </strong>
             </p>
           </div>
@@ -215,12 +296,12 @@ export const AdminSettingsTab: React.FC<{
             type="button"
             onClick={async () => {
               const res = await apiFetch<any>('/api/admin/email/process-queue', { method: 'POST' });
-              setMsg(`Processed ${res.processed} queued email event(s).`);
+              setMsg(`Processed ${res.processed} queued notification(s).`);
               await load();
             }}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-[#172554]"
           >
-            <RefreshCw className="w-3.5 h-3.5" /> Process Outbox Queue
+            <RefreshCw className="w-3.5 h-3.5" /> Process Notification Queue
           </button>
         </div>
 
@@ -229,14 +310,14 @@ export const AdminSettingsTab: React.FC<{
             <label className="block font-semibold mb-1">Administrator Notification Email</label>
             <input
               type="email"
-              value={emailCfg.adminNotificationEmail ?? 'olarindevictor3@gmail.com'}
+              value={emailCfg.adminNotificationEmail ?? 'olarindevictor046@gmail.com'}
               onChange={(e) => setEmailCfg({ ...emailCfg, adminNotificationEmail: e.target.value })}
-              placeholder="olarindevictor3@gmail.com"
+              placeholder="olarindevictor046@gmail.com"
               className="w-full rounded-lg border border-slate-300 px-3 py-2"
             />
           </div>
           <div>
-            <label className="block font-semibold mb-1">Verified Sender Email (Brevo)</label>
+            <label className="block font-semibold mb-1">Verified Sender Email</label>
             <input
               type="email"
               value={emailCfg.fromEmail || ''}
@@ -264,7 +345,7 @@ export const AdminSettingsTab: React.FC<{
                   setTestRecipient(e.target.value);
                   setEmailCfg({ ...emailCfg, testEmailRecipient: e.target.value });
                 }}
-                placeholder="olarindevictor3@gmail.com"
+                placeholder="olarindevictor046@gmail.com"
                 className="flex-1 rounded-lg border border-slate-300 px-3 py-2"
               />
               <button
@@ -291,7 +372,7 @@ export const AdminSettingsTab: React.FC<{
       <div className="rounded-xl bg-white border border-slate-200 overflow-x-auto">
         <div className="p-4 border-b border-slate-200 flex items-center gap-2 text-sm font-bold text-[#172554]">
           <Mail className="w-4 h-4" />
-          <span>Email Notification History & Outbox</span>
+          <span>Order Notification History</span>
         </div>
         <table className="w-full text-xs">
           <thead>
@@ -309,7 +390,7 @@ export const AdminSettingsTab: React.FC<{
             {emailHistory.length === 0 ? (
               <tr>
                 <td colSpan={7} className="p-6 text-center text-slate-500">
-                  No email notification events logged yet.
+                  No order notifications sent yet.
                 </td>
               </tr>
             ) : (
@@ -317,25 +398,24 @@ export const AdminSettingsTab: React.FC<{
                 <tr key={ev.event_id}>
                   <td className="p-3">
                     <div className="font-mono-tabular font-bold text-[#172554]">
-                      {ev.order_number || ev.notification_type}
+                      {ev.order_number || ev.notification_type.replace(/_/g, ' ')}
                     </div>
-                    <div className="text-[11px] text-slate-400">
-                      {ev.recipient_type} · {ev.event_id.slice(0, 12)}
+                    <div className="text-[11px] text-slate-400 capitalize">
+                      {ev.recipient_type}
                     </div>
                   </td>
                   <td className="p-3">{ev.recipient_email}</td>
                   <td className="p-3 max-w-xs truncate">{ev.subject}</td>
                   <td className="p-3">
                     <div className="font-semibold capitalize">
-                      {String(ev.status).replace(/_/g, ' ')}
+                      {ev.status === 'accepted_by_provider'
+                        ? 'Dispatched'
+                        : String(ev.status).replace(/_/g, ' ')}
                     </div>
-                    {ev.provider_message_id && (
-                      <div className="text-[10px] font-mono-tabular text-slate-400">
-                        ID: {ev.provider_message_id}
-                      </div>
-                    )}
                     {ev.last_error && (
-                      <div className="text-[11px] text-[#9A2E1E]">{ev.last_error}</div>
+                      <div className="text-[11px] text-[#9A2E1E]">
+                        {sanitizeNotificationError(ev.last_error)}
+                      </div>
                     )}
                   </td>
                   <td className="p-3 tabular-nums">
@@ -502,15 +582,10 @@ export const AdminSettingsTab: React.FC<{
   );
 
   const SETTINGS_NAV: Array<{ id: SettingsSection; label: string; icon: any }> = [
-    { id: 'profile', label: 'A. Store Profile', icon: Building2 },
-    { id: 'staff', label: 'B. Owner & Staff', icon: Shield },
-    { id: 'payments', label: 'C. Payments & Banking', icon: Landmark },
-    { id: 'delivery', label: 'D. Delivery & Shipping', icon: Truck },
-    { id: 'email', label: 'E. Email & Notifications', icon: Mail },
-    { id: 'seo', label: 'F. SEO & Search Console', icon: Globe },
-    { id: 'analytics', label: 'G. Analytics (GA4)', icon: BarChart3 },
-    { id: 'integrations', label: 'H. Integrations', icon: Plug },
-    { id: 'appearance', label: 'I. Appearance & Content', icon: Palette },
+    { id: 'profile', label: 'Store Profile', icon: Building2 },
+    { id: 'staff', label: 'Owner & Staff', icon: Shield },
+    { id: 'payments', label: 'Payments & Banking', icon: Landmark },
+    ...(isOwner ? [{ id: 'security' as const, label: 'Security & Support Access', icon: ShieldAlert }] : []),
   ];
 
   return (
@@ -531,7 +606,7 @@ export const AdminSettingsTab: React.FC<{
 
       {mode === 'settings' && (
         <div className="space-y-6">
-          {/* 9-Section Settings Centre Nav */}
+          {/* Store Settings Nav */}
           <div className="flex flex-wrap gap-1.5 p-1.5 bg-white border border-slate-200 rounded-xl">
             {SETTINGS_NAV.map((item) => {
               const Icon = item.icon;
@@ -553,10 +628,10 @@ export const AdminSettingsTab: React.FC<{
             })}
           </div>
 
-          {/* A. Store Profile */}
+          {/* Store Profile */}
           {section === 'profile' && (
             <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4 text-xs">
-              <h2 className="text-lg font-bold text-[#172554]">A. Store Profile</h2>
+              <h2 className="text-lg font-bold text-[#172554]">Store Profile</h2>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block font-semibold mb-1">Store Name</label>
@@ -707,196 +782,239 @@ export const AdminSettingsTab: React.FC<{
             </div>
           )}
 
-          {/* B. Owner & Staff */}
+          {/* Owner & Staff */}
           {section === 'staff' && (
             <div className="space-y-6 text-xs">
-              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
-                <h2 className="text-lg font-bold text-[#172554]">B. Official Store Owner Identity</h2>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-[#F5F7F4] border border-slate-200 rounded-xl p-4">
-                  <div>
-                    <span className="text-slate-500 block">Designated Owner Email</span>
-                    <strong className="text-sm text-[#172554]">
-                      {ownerSummary.designatedOwnerEmail || 'olarindevictor3@gmail.com'}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Ownership Status</span>
-                    <strong className="text-sm text-[#172554]">
-                      {ownerSummary.ownerExists
-                        ? `Verified (${ownerSummary.ownerRecord?.email || 'Active'})`
-                        : 'Awaiting First Sign-In'}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Sign-In Methods</span>
-                    <strong className="text-sm text-emerald-700">
-                      {ownerSummary.googleOAuthConfigured
-                        ? 'Google OAuth & Email / Password'
-                        : 'Email / Password (Google OAuth awaiting credentials)'}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-
-              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
-                <div className="flex items-center gap-2 text-base font-bold text-[#172554]">
-                  <Shield className="w-4 h-4" />
-                  <span>Staff Roles, Invitations & Backend Permissions (Owner Only)</span>
-                </div>
-                {staffForbidden ? (
+              {!isOwner ? (
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-2">
+                  <h2 className="text-base font-bold text-[#172554]">Owner & Staff Management</h2>
                   <p className="text-slate-600">
-                    Restricted: Only the verified store owner can view or manage staff and admin roles.
+                    Staff accounts, active sessions, and security activity logs are restricted to the store owner.
                   </p>
-                ) : (
-                  <>
-                    <form onSubmit={createStaff} className="grid grid-cols-1 sm:grid-cols-5 gap-2">
-                      <input
-                        type="text"
-                        required
-                        value={newStaffName}
-                        onChange={(e) => setNewStaffName(e.target.value)}
-                        placeholder="Staff Name"
-                        className="rounded-lg border border-slate-300 px-3 py-2"
-                      />
-                      <input
-                        type="email"
-                        required
-                        value={newStaffEmail}
-                        onChange={(e) => setNewStaffEmail(e.target.value)}
-                        placeholder="Email"
-                        className="rounded-lg border border-slate-300 px-3 py-2"
-                      />
-                      <input
-                        type="password"
-                        required
-                        minLength={8}
-                        value={newStaffPwd}
-                        onChange={(e) => setNewStaffPwd(e.target.value)}
-                        placeholder="Initial Password"
-                        className="rounded-lg border border-slate-300 px-3 py-2"
-                      />
-                      <select
-                        value={newStaffRole}
-                        onChange={(e) => setNewStaffRole(e.target.value)}
-                        className="rounded-lg border border-slate-300 px-3 py-2"
-                      >
-                        <option value="staff">Staff (General Operations)</option>
-                        <option value="admin">Administrator</option>
-                        <option value="manager">Manager</option>
-                        <option value="order_staff">Order Staff</option>
-                        <option value="inventory_staff">Inventory Staff</option>
-                        <option value="support_staff">Customer Support Staff</option>
-                      </select>
-                      <button
-                        type="submit"
-                        className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
-                      >
-                        Add Staff
-                      </button>
+                </div>
+              ) : (
+                <>
+                  <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
+                    <h2 className="text-lg font-bold text-[#172554]">Store Owner Identity</h2>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-[#F5F7F4] border border-slate-200 rounded-xl p-4">
+                      <div>
+                        <span className="text-slate-500 block">Store Owner Email</span>
+                        <strong className="text-sm text-[#172554]">
+                          {ownerSummary.designatedOwnerEmail || 'olarindevictor046@gmail.com'}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">Ownership Status</span>
+                        <strong className="text-sm text-[#172554]">
+                          {ownerSummary.ownerExists
+                            ? `Verified (${ownerSummary.ownerRecord?.email || 'Active'})`
+                            : 'Active'}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">Sign-In Methods</span>
+                        <strong className="text-sm text-emerald-700">
+                          {ownerSummary.googleOAuthConfigured
+                            ? 'Google Sign-In & Email / Password'
+                            : 'Email & Password'}
+                        </strong>
+                      </div>
+                    </div>
+
+                    {ownerSummary.emailMigrationPending && (
+                      <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+                        Your active login account ({ownerSummary.ownerRecord?.email}) does not yet match the
+                        configured administrator login email ({ownerSummary.designatedOwnerEmail}). Use the verified
+                        email change form below to complete verification without affecting store history.
+                      </div>
+                    )}
+
+                    <form
+                      onSubmit={requestOwnerEmailChange}
+                      className="border-t border-slate-200 pt-4 space-y-2"
+                    >
+                      <label className="block font-semibold text-[#172554]">
+                        Change Administrator Login Email (Verified)
+                      </label>
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <input
+                          type="email"
+                          required
+                          value={newOwnerEmail}
+                          onChange={(e) => setNewOwnerEmail(e.target.value)}
+                          placeholder="new-admin@example.com"
+                          className="flex-1 rounded-lg border border-slate-300 px-3 py-2"
+                        />
+                        <button
+                          type="submit"
+                          disabled={ownerEmailBusy}
+                          className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B] disabled:opacity-60"
+                        >
+                          {ownerEmailBusy ? 'Sending Verification...' : 'Send Verification Link'}
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Updating the administrator login email preserves your account ID and store history, requires
+                        email verification before taking effect, and clears prior external sign-in links for security.
+                      </p>
                     </form>
-                    <div className="divide-y divide-slate-100">
-                      {staff.map((s) => (
-                        <div key={s.id} className="py-2.5 flex justify-between items-center gap-3">
-                          <div>
-                            <span className="font-bold text-[#172554]">{s.name}</span> ({s.email})
-                            <div className="text-[11px] text-slate-400">
-                              {(s.permissions || []).length} permission(s) ·{' '}
-                              {s.isActive ? 'Active' : 'Suspended'}
+                  </div>
+
+                  <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
+                    <div className="flex items-center gap-2 text-base font-bold text-[#172554]">
+                      <Shield className="w-4 h-4" />
+                      <span>Staff Accounts & Roles</span>
+                    </div>
+                    {staffForbidden ? (
+                      <p className="text-slate-600">
+                        Restricted: Only the store owner can view or manage staff roles.
+                      </p>
+                    ) : (
+                      <>
+                        <form onSubmit={createStaff} className="grid grid-cols-1 sm:grid-cols-5 gap-2">
+                          <input
+                            type="text"
+                            required
+                            value={newStaffName}
+                            onChange={(e) => setNewStaffName(e.target.value)}
+                            placeholder="Staff Name"
+                            className="rounded-lg border border-slate-300 px-3 py-2"
+                          />
+                          <input
+                            type="email"
+                            required
+                            value={newStaffEmail}
+                            onChange={(e) => setNewStaffEmail(e.target.value)}
+                            placeholder="Email"
+                            className="rounded-lg border border-slate-300 px-3 py-2"
+                          />
+                          <input
+                            type="password"
+                            required
+                            minLength={8}
+                            value={newStaffPwd}
+                            onChange={(e) => setNewStaffPwd(e.target.value)}
+                            placeholder="Initial Password"
+                            className="rounded-lg border border-slate-300 px-3 py-2"
+                          />
+                          <select
+                            value={newStaffRole}
+                            onChange={(e) => setNewStaffRole(e.target.value)}
+                            className="rounded-lg border border-slate-300 px-3 py-2"
+                          >
+                            <option value="staff">Staff (General Operations)</option>
+                            <option value="admin">Administrator</option>
+                            <option value="manager">Manager</option>
+                            <option value="order_staff">Order Staff</option>
+                            <option value="inventory_staff">Inventory Staff</option>
+                            <option value="support_staff">Customer Support Staff</option>
+                          </select>
+                          <button
+                            type="submit"
+                            className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
+                          >
+                            Add Staff
+                          </button>
+                        </form>
+                        <div className="divide-y divide-slate-100">
+                          {staff.map((s) => (
+                            <div key={s.id} className="py-2.5 flex justify-between items-center gap-3">
+                              <div>
+                                <span className="font-bold text-[#172554]">{s.name}</span> ({s.email})
+                                <div className="text-[11px] text-slate-400 capitalize">
+                                  {s.role.replace(/_/g, ' ')} · {s.isActive ? 'Active' : 'Suspended'}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-3">
+                                <span className="capitalize font-semibold">{s.role.replace(/_/g, ' ')}</span>
+                                {s.role !== 'owner' && (
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      await apiFetch(`/api/admin/staff/${s.id}`, {
+                                        method: 'PATCH',
+                                        body: JSON.stringify({ isActive: !s.isActive }),
+                                      });
+                                      await load();
+                                    }}
+                                    className="text-[#172554] underline"
+                                  >
+                                    {s.isActive ? 'Deactivate' : 'Activate'}
+                                  </button>
+                                )}
+                              </div>
                             </div>
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <span className="capitalize font-semibold">{s.role.replace('_', ' ')}</span>
-                            {s.role !== 'owner' && (
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {!staffForbidden && (
+                    <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-[#172554]">
+                        <Activity className="w-4 h-4" />
+                        <span>Active Account Sessions</span>
+                      </div>
+                      {sessions.length === 0 ? (
+                        <p className="text-slate-500">No active sessions recorded.</p>
+                      ) : (
+                        <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto">
+                          {sessions.map((sess) => (
+                            <div key={sess.id} className="py-2 flex justify-between items-center gap-4">
+                              <div>
+                                <div className="font-semibold text-[#172554]">
+                                  {sess.email} ({sess.role})
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                  Started {formatLagosDate(sess.createdAt)} · Expires {formatLagosDate(sess.expiresAt)}
+                                </div>
+                              </div>
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  await apiFetch(`/api/admin/staff/${s.id}`, {
-                                    method: 'PATCH',
-                                    body: JSON.stringify({ isActive: !s.isActive }),
-                                  });
-                                  await load();
-                                }}
-                                className="text-[#172554] underline"
+                                onClick={() => revokeSession(sess.id)}
+                                className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
                               >
-                                {s.isActive ? 'Deactivate' : 'Activate'}
+                                Revoke
                               </button>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-
-              {!staffForbidden && (
-                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
-                  <div className="flex items-center gap-2 text-sm font-bold text-[#172554]">
-                    <Activity className="w-4 h-4" />
-                    <span>Active Account Sessions</span>
-                  </div>
-                  {sessions.length === 0 ? (
-                    <p className="text-slate-500">No active sessions recorded.</p>
-                  ) : (
-                    <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto">
-                      {sessions.map((sess) => (
-                        <div key={sess.id} className="py-2 flex justify-between items-center gap-4">
-                          <div>
-                            <div className="font-semibold text-[#172554]">
-                              {sess.email} ({sess.role})
                             </div>
-                            <div className="text-[11px] text-slate-400">
-                              Started {formatLagosDate(sess.createdAt)} · Expires {formatLagosDate(sess.expiresAt)}
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => revokeSession(sess.id)}
-                            className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
-                          >
-                            Revoke
-                          </button>
+                          ))}
                         </div>
-                      ))}
+                      )}
                     </div>
                   )}
-                </div>
-              )}
 
-              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
-                <h3 className="text-sm font-bold text-[#172554]">Security & Admin Audit Log (Owner Only)</h3>
-                {auditForbidden ? (
-                  <p className="text-slate-600">
-                    Restricted: Security audit logs are viewable only by the store owner.
-                  </p>
-                ) : (
-                  <div className="divide-y divide-slate-100 max-h-64 overflow-y-auto">
-                    {auditLogs.map((l) => (
-                      <div key={l.id} className="py-2 flex justify-between gap-4">
-                        <div>
-                          <span className="font-mono-tabular font-bold text-[#172554]">{l.action}</span>{' '}
-                          <span className="text-slate-600">
-                            by {l.actor_email || 'system'} ({l.actor_role || '—'}) on {l.target_type}{' '}
-                            {l.target_id}
-                          </span>
-                        </div>
-                        <span className="text-slate-400 tabular-nums shrink-0">
-                          {formatLagosDate(l.created_at)}
-                        </span>
+                  {!auditForbidden && (
+                    <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                      <h3 className="text-sm font-bold text-[#172554]">Account Activity Log</h3>
+                      <div className="divide-y divide-slate-100 max-h-64 overflow-y-auto">
+                        {auditLogs.map((l) => (
+                          <div key={l.id} className="py-2 flex justify-between gap-4">
+                            <div>
+                              <span className="font-mono-tabular font-bold text-[#172554]">{l.action}</span>{' '}
+                              <span className="text-slate-600">
+                                by {l.actor_email || 'system'} ({l.actor_role || '—'})
+                              </span>
+                            </div>
+                            <span className="text-slate-400 tabular-nums shrink-0">
+                              {formatLagosDate(l.created_at)}
+                            </span>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
 
-          {/* C. Payments & Banking */}
+          {/* Payments & Banking */}
           {section === 'payments' && (
             <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4 text-xs">
-              <h2 className="text-lg font-bold text-[#172554]">C. Payments & Nigerian Banking</h2>
+              <h2 className="text-lg font-bold text-[#172554]">Payments & Nigerian Banking</h2>
               <p className="text-slate-500">
-                Configure your genuine Nigerian business bank account for manual transfer checkout. Never fabricated automatically.
+                Configure your Nigerian business bank account for customer bank transfer checkout.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
@@ -954,287 +1072,154 @@ export const AdminSettingsTab: React.FC<{
             </div>
           )}
 
-          {/* D. Delivery & Shipping Summary */}
-          {section === 'delivery' && (
-            <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4 text-xs">
-              <h2 className="text-lg font-bold text-[#172554]">D. Delivery & Nigerian Shipping Zones</h2>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-[#F5F7F4] border border-slate-200 rounded-xl p-4">
-                <div>
-                  <span className="text-slate-500 block">Enabled State/LGA Zones</span>
-                  <strong className="text-xl text-[#172554] tabular-nums">
-                    {deliverySummary.enabledZones ?? 0}
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-slate-500 block">Covered Nigerian States</span>
-                  <strong className="text-xl text-[#172554] tabular-nums">
-                    {deliverySummary.coveredStates ?? 0}
-                  </strong>
-                </div>
-              </div>
-              <p className="text-slate-600 leading-relaxed">
-                Checkout fails closed and never invents delivery charges for unconfigured States or LGAs. Open the <strong>Delivery Zones</strong> tab in the admin navigation bar to add or adjust State/LGA shipping rates, couriers, and free-shipping thresholds.
-              </p>
-            </div>
-          )}
-
-          {/* E. Email & Notifications */}
-          {section === 'email' && renderEmailSection()}
-
-          {/* F. SEO & Google Search Console */}
-          {section === 'seo' && (
-            <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-5 text-xs">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-lg font-bold text-[#172554]">F. SEO & Google Search Console</h2>
-                  <p className="text-slate-500">
-                    Dynamic sitemap, robots rules, canonical URLs, JSON-LD structured data, and HTML verification meta tag.
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <a
-                    href="/sitemap.xml"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold text-[#172554] hover:bg-slate-50"
-                  >
-                    View /sitemap.xml
-                  </a>
-                  <a
-                    href="/robots.txt"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold text-[#172554] hover:bg-slate-50"
-                  >
-                    View /robots.txt
-                  </a>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-[#F5F7F4] border border-slate-200 rounded-xl p-4">
-                <div>
-                  <span className="text-slate-500 block">Active Products With Custom SEO</span>
-                  <strong className="text-sm text-[#172554]">
-                    {seoSummary.productsWithSeo ?? 0} / {seoSummary.activeProducts ?? 0}
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-slate-500 block">Search Console Verification Tag</span>
-                  <strong className={seo.googleSiteVerification ? 'text-emerald-700 text-sm' : 'text-amber-700 text-sm'}>
-                    {seo.googleSiteVerification ? 'Configured in <head>' : 'Not Set Yet'}
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-slate-500 block">Public Store Indexing</span>
-                  <strong className="text-sm text-[#172554]">
-                    {seo.indexingEnabled !== false ? 'index, follow' : 'noindex, nofollow'}
-                  </strong>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block font-semibold mb-1">Global Site Title</label>
-                  <input
-                    type="text"
-                    value={seo.siteTitle || ''}
-                    onChange={(e) => setSeo({ ...seo, siteTitle: e.target.value })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold mb-1">Canonical Production Domain</label>
-                  <input
-                    type="url"
-                    value={seo.canonicalBaseUrl || ''}
-                    onChange={(e) => setSeo({ ...seo, canonicalBaseUrl: e.target.value })}
-                    placeholder="https://sellora.example.com"
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <label className="block font-semibold mb-1">Global Meta Description</label>
-                  <textarea
-                    rows={2}
-                    value={seo.metaDescription || ''}
-                    onChange={(e) => setSeo({ ...seo, metaDescription: e.target.value })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold mb-1">
-                    Google Search Console Verification Meta Token
-                  </label>
-                  <input
-                    type="text"
-                    value={seo.googleSiteVerification || ''}
-                    onChange={(e) => setSeo({ ...seo, googleSiteVerification: e.target.value })}
-                    placeholder="Paste token from <meta name='google-site-verification' content='...'>"
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold mb-1">Default Social Share / OG Image</label>
-                  <input
-                    type="text"
-                    value={seo.defaultOgImage || ''}
-                    onChange={(e) => setSeo({ ...seo, defaultOgImage: e.target.value })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                  />
-                </div>
-              </div>
-
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={seo.indexingEnabled !== false}
-                  onChange={(e) => setSeo({ ...seo, indexingEnabled: e.target.checked })}
-                />
-                Allow search engines to index public storefront, product, and category pages (admin/account/checkout/API always remain noindex)
-              </label>
-
-              <div className="rounded-lg border border-slate-200 bg-[#F5F7F4] p-4 space-y-1.5 text-slate-600">
-                <div className="font-bold text-[#172554]">Search Console Submission Steps</div>
-                <p>1. Open Google Search Console, add a URL prefix property matching your canonical domain, and choose the HTML tag verification method.</p>
-                <p>2. Paste the verification token above and click Save SEO Settings (or set GOOGLE_SITE_VERIFICATION in Cloudflare environment vars).</p>
-                <p>3. In Search Console → Sitemaps, submit <code className="font-mono-tabular">sitemap.xml</code>.</p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => saveSetting('seo', seo)}
-                className="rounded-lg bg-[#172554] px-5 py-2.5 font-bold text-[#B7F36B]"
-              >
-                Save SEO Settings
-              </button>
-            </div>
-          )}
-
-          {/* G. Analytics & Insights (GA4) */}
-          {section === 'analytics' && (
-            <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4 text-xs">
-              <h2 className="text-lg font-bold text-[#172554]">G. Google Analytics 4 (GA4) & Telemetry</h2>
-              <p className="text-slate-600">
-                Tracks anonymized SPA page views, product views, add-to-bag, begin-checkout, and strictly confirmed bank transfer purchases (<code className="font-mono-tabular">payment_confirmed</code> only). Never sends emails, phone numbers, or customer addresses to GA4.
-              </p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block font-semibold mb-1">GA4 Measurement ID</label>
-                  <input
-                    type="text"
-                    value={seo.gaMeasurementId || ''}
-                    onChange={(e) => setSeo({ ...seo, gaMeasurementId: e.target.value.trim() })}
-                    placeholder="G-XXXXXXXXXX"
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular"
-                  />
-                </div>
-                <div className="rounded-lg bg-[#F5F7F4] border border-slate-200 p-3">
-                  <div className="text-slate-500">Current Tracking State</div>
-                  <strong className={seo.gaMeasurementId ? 'text-emerald-700' : 'text-amber-700'}>
-                    {seo.gaMeasurementId
-                      ? `GA4 Active (${seo.gaMeasurementId}) + D1 First-Party Insights`
-                      : 'GA4 Optional ID Not Set (First-party D1 Funnel Active)'}
-                  </strong>
-                </div>
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-[#F5F7F4] p-4 text-slate-600">
-                External GA4 historical Data API reporting requires service-account credentials and is viewed directly inside analytics.google.com. Real first-party traffic & conversion funnel metrics are recorded in D1 and displayed in the <strong>Analytics & Profit</strong> tab.
-              </div>
-              <button
-                type="button"
-                onClick={() => saveSetting('seo', seo)}
-                className="rounded-lg bg-[#172554] px-5 py-2.5 font-bold text-[#B7F36B]"
-              >
-                Save Analytics Configuration
-              </button>
-            </div>
-          )}
-
-          {/* H. Integrations */}
-          {section === 'integrations' && (
-            <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4 text-xs">
-              <h2 className="text-lg font-bold text-[#172554]">H. Connected Services & Integrations</h2>
-              <p className="text-slate-500">
-                Real environment readiness derived from server bindings. Secrets are never exposed to the browser.
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {integrationStatus.map((item) => (
-                  <div
-                    key={item.id}
-                    className="rounded-xl border border-slate-200 bg-[#F5F7F4] p-4 flex items-start justify-between gap-3"
-                  >
-                    <div>
-                      <div className="font-bold text-[#172554]">{item.name}</div>
-                      <p className="text-slate-600 mt-0.5">{item.detail}</p>
-                    </div>
-                    <span
-                      className={`px-2 py-0.5 rounded font-semibold uppercase text-[10px] shrink-0 ${
-                        item.status === 'connected'
-                          ? 'bg-emerald-100 text-emerald-800'
-                          : item.status === 'awaiting_credentials'
-                            ? 'bg-amber-100 text-amber-800'
-                            : 'bg-slate-200 text-slate-700'
-                      }`}
-                    >
-                      {String(item.status).replace(/_/g, ' ')}
-                    </span>
+          {/* Security Alerts & Authorized Technical Access (Owner Only) */}
+          {section === 'security' && isOwner && (
+            <div className="space-y-6 text-xs">
+              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-base font-bold text-[#172554]">Account Protection & Sessions</h2>
+                    <p className="text-slate-500">
+                      Sign-in verification alerts and unauthorized-device response stay active for all store accounts.
+                    </p>
                   </div>
-                ))}
-              </div>
-              <div className="rounded-lg border border-slate-200 p-3 text-slate-600">
-                Optional Gemini AI Integration:{' '}
-                <strong>
-                  {capabilities?.aiConfigured
-                    ? 'Configured on server (strictly non-financial).'
-                    : 'Not configured (100% independent free-tier operation).'}
-                </strong>
+                  <button
+                    type="button"
+                    onClick={revokeMyOtherSessions}
+                    className="rounded-lg border border-[#F47B68] px-3.5 py-2 font-semibold text-[#9A2E1E] hover:bg-[#F47B68]/10"
+                  >
+                    Sign Out Other Devices
+                  </button>
+                </div>
               </div>
 
-              <div className="rounded-xl border border-slate-200 bg-[#F5F7F4] p-4 space-y-2 text-slate-700">
-                <div className="font-bold text-[#172554]">
-                  Google Auth Platform Branding & OAuth Client Setup
+              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
+                <div className="flex items-center gap-2 text-base font-bold text-[#172554]">
+                  <KeyRound className="w-4 h-4" />
+                  <span>Authorized Technical Support Access</span>
                 </div>
-                <p className="text-slate-600 leading-relaxed">
-                  Google displays the consent screen app name, logo, and verified domain directly from your Google Cloud Console{' '}
-                  <strong>Google Auth Platform → Branding / Audience / Clients</strong> configuration (not client-side HTML). Until a custom domain is verified and published in Google Cloud, Google displays the active runtime hostname.
+                <p className="text-slate-500">
+                  Issue revocable, read-scoped diagnostic access keys when granting troubleshooting permission.
+                  Technical error traces remain isolated from your store dashboard and customer orders.
                 </p>
-                {(() => {
-                  const origin = typeof window !== 'undefined' ? window.location.origin : '';
-                  return (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 font-mono-tabular text-[11px]">
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">App Name & Support Email</span>
-                        <span>SELLORA · {ownerSummary.designatedOwnerEmail || 'olarindevictor3@gmail.com'}</span>
-                      </div>
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">App Logo File (Upload in Google Cloud)</span>
-                        <span>{origin}/pwa-512x512.png</span>
-                      </div>
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">Homepage URL</span>
-                        <span>{origin}/</span>
-                      </div>
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">Privacy Policy & Terms URLs</span>
-                        <span>{origin}/privacy-policy · {origin}/terms</span>
-                      </div>
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">Authorized JavaScript Origin</span>
-                        <span>{origin}</span>
-                      </div>
-                      <div className="rounded-lg bg-white border border-slate-200 p-2.5">
-                        <span className="text-slate-400 block font-sans">Authorized Redirect URI (Better Auth)</span>
-                        <span>{origin}/api/auth/callback/google</span>
-                      </div>
+
+                {createdIntegrationKey && (
+                  <div className="rounded-xl bg-[#F5F7F4] border border-[#172554]/30 p-4 space-y-2">
+                    <div className="font-bold text-[#172554]">
+                      New Support Access Key (shown once only — store securely)
                     </div>
-                  );
-                })()}
+                    <div className="font-mono-tabular break-all bg-white border border-slate-200 rounded px-3 py-2 text-[#172554]">
+                      {createdIntegrationKey}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setCreatedIntegrationKey(null)}
+                      className="text-[11px] font-semibold text-slate-600 underline"
+                    >
+                      Hide Key
+                    </button>
+                  </div>
+                )}
+
+                <form onSubmit={createIntegrationAccess} className="flex flex-wrap gap-2">
+                  <input
+                    type="text"
+                    required
+                    value={portalName}
+                    onChange={(e) => setPortalName(e.target.value)}
+                    placeholder="Authorized support team name"
+                    className="flex-1 min-w-[200px] rounded-lg border border-slate-300 px-3 py-2"
+                  />
+                  <button
+                    type="submit"
+                    className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
+                  >
+                    Generate 90-Day Diagnostic Key
+                  </button>
+                </form>
+
+                {integrations.length > 0 && (
+                  <div className="divide-y divide-slate-100">
+                    {integrations.map((intg) => (
+                      <div key={intg.id} className="py-2.5 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="font-semibold text-[#172554]">
+                            {intg.portal_name}{' '}
+                            <span className="font-mono-tabular text-slate-500">({intg.key_prefix}...)</span>
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {intg.is_active ? 'Active' : 'Revoked'} · Created {formatLagosDate(intg.created_at)}
+                            {intg.expires_at ? ` · Expires ${formatLagosDate(intg.expires_at)}` : ''}
+                          </div>
+                        </div>
+                        {Boolean(intg.is_active) && (
+                          <button
+                            type="button"
+                            onClick={() => revokeIntegrationAccess(intg.id)}
+                            className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
+                          >
+                            Revoke Access
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                  <h3 className="text-sm font-bold text-[#172554]">Recent Security Alerts</h3>
+                  {securityEvents.length === 0 ? (
+                    <p className="text-slate-500">No security alerts recorded yet.</p>
+                  ) : (
+                    <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                      {securityEvents.map((ev) => (
+                        <div key={ev.id} className="py-2 space-y-0.5">
+                          <div className="flex justify-between font-semibold text-[#172554]">
+                            <span className="font-mono-tabular">{ev.event_ref}</span>
+                            <span className="uppercase text-[11px]">{ev.severity}</span>
+                          </div>
+                          <div className="text-slate-600 capitalize">
+                            {String(ev.event_category).replace(/_/g, ' ')} ·{' '}
+                            {ev.device_summary || ev.email || 'Account security notice'}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            Status: {String(ev.status).replace(/_/g, ' ')} · {formatLagosDate(ev.created_at)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                  <h3 className="text-sm font-bold text-[#172554]">Recent Sign-In Activity</h3>
+                  {loginHistory.length === 0 ? (
+                    <p className="text-slate-500">No sign-in records recorded yet.</p>
+                  ) : (
+                    <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                      {loginHistory.map((lg) => (
+                        <div key={lg.id} className="py-2 space-y-0.5">
+                          <div className="flex justify-between font-semibold text-[#172554]">
+                            <span>{lg.email}</span>
+                            <span className="capitalize">{lg.outcome}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {lg.device_summary} · {lg.approx_location || 'Location unavailable'}
+                            {lg.is_new_device ? ' · New device' : ''}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            {formatLagosDate(lg.created_at)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           )}
-
-          {/* I. Appearance & Content */}
-          {section === 'appearance' && renderAppearanceSection()}
         </div>
       )}
     </div>

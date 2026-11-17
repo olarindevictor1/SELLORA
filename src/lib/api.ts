@@ -1,5 +1,35 @@
 const CART_TOKEN_KEY = 'sellora_cart_token';
 
+export function getApiBaseUrl(override?: string): string {
+  const raw = (
+    override !== undefined
+      ? override
+      : typeof import.meta !== 'undefined' && (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE_URL
+        ? (import.meta as { env?: Record<string, string | undefined> }).env!.VITE_API_BASE_URL || ''
+        : ''
+  ).trim();
+  if (!raw || raw.includes('your-sellora-domain') || raw.includes('REPLACE_WITH')) {
+    return '';
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+export function resolveApiUrl(path: string, baseOverride?: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const base = getApiBaseUrl(baseOverride);
+  return base ? `${base}${normalizedPath}` : normalizedPath;
+}
+
+export function resolveMediaUrl(url?: string | null, baseOverride?: string): string {
+  const raw = (url || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('/api/')) {
+    return resolveApiUrl(raw, baseOverride);
+  }
+  return raw;
+}
+
 export function getCartToken(): string {
   let token = localStorage.getItem(CART_TOKEN_KEY);
   if (!token) {
@@ -19,7 +49,7 @@ export async function apiFetch<T = any>(
   }
   headers.set('x-cart-token', getCartToken());
 
-  const res = await fetch(path, {
+  const res = await fetch(resolveApiUrl(path), {
     ...options,
     headers,
     credentials: 'include',
@@ -36,7 +66,9 @@ export async function apiFetch<T = any>(
   }
 
   if (!res.ok) {
-    throw new Error(data?.error || data?.message || `Request failed (${res.status})`);
+    const baseMsg = data?.error || data?.message || `Request failed (${res.status})`;
+    const refSuffix = data?.referenceId ? ` (Reference: ${data.referenceId})` : '';
+    throw new Error(`${baseMsg}${refSuffix}`);
   }
 
   return data as T;
