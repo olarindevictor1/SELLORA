@@ -55,6 +55,7 @@ export function App() {
   const [trackOrderParam, setTrackOrderParam] = useState<string>('');
 
   const [user, setUser] = useState<any>(null);
+  const [adminSecurity, setAdminSecurity] = useState<any>(null);
   const [sessionLoaded, setSessionLoaded] = useState(false);
   const [capabilities, setCapabilities] = useState<any>({});
 
@@ -95,6 +96,7 @@ export function App() {
     try {
       const meRes = await apiFetch<any>('/api/me');
       setUser(meRes.user || null);
+      setAdminSecurity(meRes.adminSecurity || null);
       setCapabilities(meRes.capabilities || {});
     } catch {
       // ignore
@@ -593,12 +595,14 @@ export function App() {
       <>
         <AdminDashboard
           user={user}
+          adminSecurity={adminSecurity}
           capabilities={capabilities}
           onExitAdmin={() => {
             window.history.replaceState({}, '', '/');
             navigate('home');
           }}
           onRefreshStorefront={refreshStorefront}
+          onRefreshSession={refreshSession}
         />
         <OfflineIndicator />
       </>

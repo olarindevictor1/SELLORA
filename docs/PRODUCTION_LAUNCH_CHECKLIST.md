@@ -19,6 +19,12 @@
 - [x] **CSRF, CORS & HTTP Security Headers**: Origin/`Sec-Fetch-Site` enforcement, strict CORS allowlist, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, `Cache-Control: no-store`, and HTTPS HSTS + Worker HTML CSP implemented locally.
   - [ ] Verify HSTS and CSP headers on live `APP_URL` after deployment.
 - [x] **Admin Schema Validation & Layer 3 Architecture**: Zod validation added on remaining `admin.ts` write routes; step-up recent auth required for payouts/email/developer keys; private `ERR-XXXXXXXX` error monitoring (`error_monitoring_logs`), device login alerts (`login_history`, `known_user_devices`, `login_verification_tokens`), immutable `audit_logs`, and isolated `/api/developer/*` portal routes implemented.
+- [ ] **Confirmed Security & SKU Specification Implementation (`A–E`)**:
+  - [ ] **A. Manual & Auto SKU Management**: Manual + auto SKU entry on products and individual variants, DB case-insensitive uniqueness, `409` duplicate rejection, and immutable-once-ordered SKU enforcement.
+  - [ ] **B. Separate Admin Security Password**: Strong salted hash, session-bound verification with expiry TTL, rate-limiting/lockout, and safe setup/change/recovery flow enforced before admin dashboard access.
+  - [ ] **C. Strict Unfamiliar-Device & IP Lock**: Server-issued cryptographic `HttpOnly` device token + trusted IP enforcement locking admin dashboard & `/api/admin/*` whenever either is unfamiliar.
+  - [ ] **D. Scanner-Safe Gmail Approval Workflow**: Brevo alert to registered admin Gmail with explicit `GET` confirmation page + `POST` **`YES — APPROVE ACCESS`** / **`NO — REJECT ACCESS`** submission, short-lived single-use CSPRNG tokens, and Gmail-loss recovery path.
+  - [ ] **E. Admin Security Management UI**: Recognized devices, login attempts, pending approval requests, device/session revocation, and admin security password controls in Admin Settings.
 
 ---
 
@@ -28,7 +34,7 @@
 - [ ] `GET https://<APP_URL>/api/health` returns `200`, and owner-authenticated `GET https://<APP_URL>/api/admin/infrastructure-status` returns `"runtime":"cloudflare-worker"`, `"database":"cloudflare-d1"`, `"storage":"cloudflare-r2"`.
 - [ ] Mobile Capacitor builds (`android` / `ios`) built with `VITE_API_BASE_URL` pointing to exact live `<APP_URL>`.
 - [ ] D1 `sellora-db` (`a6738474-f10d-4210-b8fe-194fab0e3bd8`) backup exported prior to applying migrations (`wrangler d1 export sellora-db --remote ...`).
-- [ ] All SQL migrations (`0001_initial.sql`, `0002_security_indexes.sql`, `0003_seo_analytics.sql`, `0004_atomic_checkout_guards.sql`, `0005_three_layer_security.sql`, `0006_login_policy_and_owner_email.sql`) applied non-destructively to remote D1 and verified in `schema_migrations`, followed by staging/pre-prod D1 smoke tests.
+- [ ] All SQL migrations (`0001_initial.sql`, `0002_security_indexes.sql`, `0003_seo_analytics.sql`, `0004_atomic_checkout_guards.sql`, `0005_three_layer_security.sql`, `0006_login_policy_and_owner_email.sql`, and planned `0007_sku_and_strict_admin_security.sql` once implemented) applied non-destructively to remote D1 and verified in `schema_migrations`, followed by staging/pre-prod D1 smoke tests.
 - [ ] Private R2 bucket `sellora-media-private` verified (no public bucket listing/anonymous URL access; receipts accessed strictly via `/api/payments/evidence/:evidenceId/file`, product media uploaded/served/deleted via `/api/admin/media/*` and `/api/media/products/:file`).
 - [ ] Production environment variables & Wrangler secrets configured (never committed to repo):
   - [ ] `APP_URL` set to exact live `https://` origin

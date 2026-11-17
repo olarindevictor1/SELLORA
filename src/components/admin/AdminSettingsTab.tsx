@@ -36,7 +36,8 @@ export const AdminSettingsTab: React.FC<{
   onRefreshStorefront: () => Promise<void>;
 }> = ({ mode, user, onRefreshStorefront }) => {
   const isOwner = user?.role === 'owner';
-  const [section, setSection] = useState<SettingsSection>('profile');
+  const canWriteSettings = isOwner || (user?.permissions || []).includes('settings:write');
+  const [section, setSection] = useState<SettingsSection>(canWriteSettings ? 'profile' : 'security');
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -58,6 +59,11 @@ export const AdminSettingsTab: React.FC<{
   const [securityEvents, setSecurityEvents] = useState<any[]>([]);
   const [loginHistory, setLoginHistory] = useState<any[]>([]);
   const [integrations, setIntegrations] = useState<any[]>([]);
+  const [trustedDevices, setTrustedDevices] = useState<any[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<any[]>([]);
+  const [curSecPwd, setCurSecPwd] = useState('');
+  const [newSecPwd, setNewSecPwd] = useState('');
+  const [rotatedRecCode, setRotatedRecCode] = useState<string | null>(null);
   const [portalName, setPortalName] = useState('Authorized Support Team');
   const [createdIntegrationKey, setCreatedIntegrationKey] = useState<string | null>(null);
   const [newStaffName, setNewStaffName] = useState('');
@@ -70,12 +76,14 @@ export const AdminSettingsTab: React.FC<{
   const load = async () => {
     setErr(null);
     try {
-      const sRes = await apiFetch<any>('/api/admin/settings');
-      setBank(sRes.settings?.bank_transfer || {});
-      setTheme(sRes.settings?.theme || {});
-      setEmailCfg(sRes.settings?.email || {});
-      setEmailStatus(sRes.emailStatus || {});
-      setOwnerSummary(sRes.ownerSummary || {});
+      if (canWriteSettings) {
+        const sRes = await apiFetch<any>('/api/admin/settings');
+        setBank(sRes.settings?.bank_transfer || {});
+        setTheme(sRes.settings?.theme || {});
+        setEmailCfg(sRes.settings?.email || {});
+        setEmailStatus(sRes.emailStatus || {});
+        setOwnerSummary(sRes.ownerSummary || {});
+      }
 
       if (mode === 'email') {
         try {
@@ -88,21 +96,31 @@ export const AdminSettingsTab: React.FC<{
       }
 
       if (mode === 'settings') {
+        const overviewRes = await apiFetch<any>('/api/admin/security/overview').catch(() => ({
+          trustedDevices: [],
+          pendingApprovals: [],
+          recentLogins: [],
+          securityEvents: [],
+        }));
+        setTrustedDevices(overviewRes.trustedDevices || []);
+        setPendingApprovals(overviewRes.pendingApprovals || []);
+        setSecurityEvents(overviewRes.securityEvents || []);
+        setLoginHistory(overviewRes.recentLogins || []);
+
         if (!isOwner) {
           setStaffForbidden(true);
           setAuditForbidden(true);
+          const mySess = await apiFetch<any>('/api/me/sessions').catch(() => ({ sessions: [] }));
+          setSessions(mySess.sessions || []);
         } else {
           try {
-            const [stRes, sessRes, secRes, intRes] = await Promise.all([
+            const [stRes, sessRes, intRes] = await Promise.all([
               apiFetch<any>('/api/admin/staff'),
               apiFetch<any>('/api/admin/sessions').catch(() => ({ sessions: [] })),
-              apiFetch<any>('/api/admin/security-summary').catch(() => ({ events: [], logins: [] })),
               apiFetch<any>('/api/admin/developer-integrations').catch(() => ({ integrations: [] })),
             ]);
             setStaff(stRes.staff || []);
             setSessions(sessRes.sessions || []);
-            setSecurityEvents(secRes.events || []);
-            setLoginHistory(secRes.logins || []);
             setIntegrations(intRes.integrations || []);
             setStaffForbidden(false);
           } catch {
@@ -124,7 +142,7 @@ export const AdminSettingsTab: React.FC<{
 
   useEffect(() => {
     load();
-  }, [mode, section, isOwner]);
+  }, [mode, section, isOwner, canWriteSettings]);
 
   const saveSetting = async (key: string, payload: any) => {
     setMsg(null);
@@ -236,6 +254,58 @@ export const AdminSettingsTab: React.FC<{
     await apiFetch(`/api/admin/developer-integrations/${id}`, { method: 'DELETE' });
     setMsg('Technical support integration key revoked immediately.');
     await load();
+  };
+
+  const handleChangeSecPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg(null);
+    setErr(null);
+    try {
+      const res = await apiFetch<{ recoveryCode?: string }>('/api/admin/security/password/change', {
+        method: 'POST',
+        body: JSON.stringify({
+          currentPassword: curSecPwd,
+          newPassword: newSecPwd,
+        }),
+      });
+      setCurSecPwd('');
+      setNewSecPwd('');
+      if (res.recoveryCode) setRotatedRecCode(res.recoveryCode);
+      setMsg('Admin Security Password updated. Other active sessions must re-verify.');
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const revokeTrustedDevice = async (deviceId: string) => {
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ terminatedSessions: number }>(
+        `/api/admin/security/devices/${deviceId}`,
+        { method: 'DELETE' }
+      );
+      setMsg(`Trusted device revoked (${res.terminatedSessions} session(s) ended).`);
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const decideApproval = async (approvalId: string, action: 'approve' | 'reject') => {
+    setErr(null);
+    setMsg(null);
+    try {
+      await apiFetch(`/api/admin/security/approvals/${approvalId}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ action }),
+      });
+      setMsg(`Login request ${action === 'approve' ? 'approved' : 'rejected & terminated'}.`);
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
   };
 
   const requestOwnerEmailChange = async (e: React.FormEvent) => {
@@ -582,10 +652,14 @@ export const AdminSettingsTab: React.FC<{
   );
 
   const SETTINGS_NAV: Array<{ id: SettingsSection; label: string; icon: any }> = [
-    { id: 'profile', label: 'Store Profile', icon: Building2 },
-    { id: 'staff', label: 'Owner & Staff', icon: Shield },
-    { id: 'payments', label: 'Payments & Banking', icon: Landmark },
-    ...(isOwner ? [{ id: 'security' as const, label: 'Security & Support Access', icon: ShieldAlert }] : []),
+    ...(canWriteSettings
+      ? [
+          { id: 'profile' as const, label: 'Store Profile', icon: Building2 },
+          { id: 'staff' as const, label: 'Owner & Staff', icon: Shield },
+          { id: 'payments' as const, label: 'Payments & Banking', icon: Landmark },
+        ]
+      : []),
+    { id: 'security' as const, label: 'Security & Access Control', icon: ShieldAlert },
   ];
 
   return (
@@ -1072,15 +1146,17 @@ export const AdminSettingsTab: React.FC<{
             </div>
           )}
 
-          {/* Security Alerts & Authorized Technical Access (Owner Only) */}
-          {section === 'security' && isOwner && (
+          {/* Security, Trusted Devices, Pending Approvals & Technical Support Access */}
+          {section === 'security' && (
             <div className="space-y-6 text-xs">
+              {/* Separate Admin Security Password Change */}
               <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-base font-bold text-[#172554]">Account Protection & Sessions</h2>
+                    <h2 className="text-base font-bold text-[#172554]">Admin Security Password</h2>
                     <p className="text-slate-500">
-                      Sign-in verification alerts and unauthorized-device response stay active for all store accounts.
+                      Protected with scrypt key derivation. Updating invalidates secondary verification on other
+                      sessions.
                     </p>
                   </div>
                   <button
@@ -1091,74 +1167,169 @@ export const AdminSettingsTab: React.FC<{
                     Sign Out Other Devices
                   </button>
                 </div>
-              </div>
 
-              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
-                <div className="flex items-center gap-2 text-base font-bold text-[#172554]">
-                  <KeyRound className="w-4 h-4" />
-                  <span>Authorized Technical Support Access</span>
-                </div>
-                <p className="text-slate-500">
-                  Issue revocable, read-scoped diagnostic access keys when granting troubleshooting permission.
-                  Technical error traces remain isolated from your store dashboard and customer orders.
-                </p>
-
-                {createdIntegrationKey && (
-                  <div className="rounded-xl bg-[#F5F7F4] border border-[#172554]/30 p-4 space-y-2">
+                {rotatedRecCode && (
+                  <div className="rounded-xl bg-[#F5F7F4] border border-[#172554]/30 p-4 space-y-1">
                     <div className="font-bold text-[#172554]">
-                      New Support Access Key (shown once only — store securely)
+                      New Backup Recovery Code (save securely — shown once)
                     </div>
-                    <div className="font-mono-tabular break-all bg-white border border-slate-200 rounded px-3 py-2 text-[#172554]">
-                      {createdIntegrationKey}
+                    <div className="font-mono-tabular font-bold text-sm text-[#172554] select-all">
+                      {rotatedRecCode}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setCreatedIntegrationKey(null)}
-                      className="text-[11px] font-semibold text-slate-600 underline"
-                    >
-                      Hide Key
-                    </button>
                   </div>
                 )}
 
-                <form onSubmit={createIntegrationAccess} className="flex flex-wrap gap-2">
+                <form onSubmit={handleChangeSecPassword} className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <input
-                    type="text"
+                    type="password"
                     required
-                    value={portalName}
-                    onChange={(e) => setPortalName(e.target.value)}
-                    placeholder="Authorized support team name"
-                    className="flex-1 min-w-[200px] rounded-lg border border-slate-300 px-3 py-2"
+                    value={curSecPwd}
+                    onChange={(e) => setCurSecPwd(e.target.value)}
+                    placeholder="Current Security Password"
+                    className="rounded-lg border border-slate-300 px-3 py-2"
+                  />
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    value={newSecPwd}
+                    onChange={(e) => setNewSecPwd(e.target.value)}
+                    placeholder="New Security Password (min. 8 chars)"
+                    className="rounded-lg border border-slate-300 px-3 py-2"
                   />
                   <button
                     type="submit"
                     className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
                   >
-                    Generate 90-Day Diagnostic Key
+                    Update Security Password
                   </button>
                 </form>
+              </div>
 
-                {integrations.length > 0 && (
-                  <div className="divide-y divide-slate-100">
-                    {integrations.map((intg) => (
-                      <div key={intg.id} className="py-2.5 flex items-center justify-between gap-3">
+              {/* Recognized Trusted Devices & IPs + Pending Approvals */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                  <h3 className="text-sm font-bold text-[#172554]">
+                    Recognized Trusted Devices & IPs ({trustedDevices.length})
+                  </h3>
+                  {trustedDevices.length === 0 ? (
+                    <p className="text-slate-500">No trusted devices registered yet.</p>
+                  ) : (
+                    <div className="divide-y divide-slate-100 max-h-72 overflow-y-auto">
+                      {trustedDevices.map((td) => (
+                        <div key={td.id} className="py-2.5 flex items-start justify-between gap-3">
+                          <div className="space-y-0.5">
+                            <div className="font-semibold text-[#172554]">
+                              {td.device_label}{' '}
+                              <span
+                                className={`ml-1 text-[10px] uppercase font-bold ${
+                                  td.is_active ? 'text-emerald-700' : 'text-slate-400'
+                                }`}
+                              >
+                                {td.is_active ? 'Trusted' : 'Revoked'}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {td.user_email} · <span className="font-mono-tabular">{td.trusted_ip}</span> ·{' '}
+                              {td.approx_location || 'Unknown location'}
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              Approved via {String(td.approved_via).replace(/_/g, ' ')} · Last seen{' '}
+                              {formatLagosDate(td.last_seen_at)}
+                            </div>
+                          </div>
+                          {Boolean(td.is_active) && (
+                            <button
+                              type="button"
+                              onClick={() => revokeTrustedDevice(td.id)}
+                              className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E] shrink-0"
+                            >
+                              Revoke
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                  <h3 className="text-sm font-bold text-[#172554]">
+                    Admin Access Approval Requests ({pendingApprovals.length})
+                  </h3>
+                  {pendingApprovals.length === 0 ? (
+                    <p className="text-slate-500">No unrecognized device or IP approval requests recorded.</p>
+                  ) : (
+                    <div className="divide-y divide-slate-100 max-h-72 overflow-y-auto">
+                      {pendingApprovals.map((ap) => (
+                        <div key={ap.id} className="py-2.5 flex items-start justify-between gap-3">
+                          <div className="space-y-0.5">
+                            <div className="font-semibold text-[#172554]">
+                              {ap.user_email} ·{' '}
+                              <span className="uppercase text-[10px]">{ap.status}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {ap.device_summary} · <span className="font-mono-tabular">{ap.ip_address}</span> ·{' '}
+                              {String(ap.trigger_reason).replace(/_/g, ' ')}
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              {formatLagosDate(ap.created_at)}
+                              {ap.decided_by ? ` · Decided by ${ap.decided_by}` : ''}
+                            </div>
+                          </div>
+                          {ap.status === 'pending' && (
+                            <div className="flex gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => decideApproval(ap.id, 'approve')}
+                                className="rounded bg-[#172554] px-2.5 py-1 text-[11px] font-bold text-[#B7F36B]"
+                              >
+                                Approve
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => decideApproval(ap.id, 'reject')}
+                                className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Active Sessions */}
+              <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
+                <div className="flex items-center gap-2 text-sm font-bold text-[#172554]">
+                  <Activity className="w-4 h-4" />
+                  <span>Active Administrative Sessions ({sessions.length})</span>
+                </div>
+                {sessions.length === 0 ? (
+                  <p className="text-slate-500">No active sessions returned.</p>
+                ) : (
+                  <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto">
+                    {sessions.map((sess) => (
+                      <div key={sess.id} className="py-2 flex justify-between items-center gap-4">
                         <div>
                           <div className="font-semibold text-[#172554]">
-                            {intg.portal_name}{' '}
-                            <span className="font-mono-tabular text-slate-500">({intg.key_prefix}...)</span>
+                            {sess.email || user?.email} {sess.role ? `(${sess.role})` : ''}
                           </div>
-                          <div className="text-[11px] text-slate-500">
-                            {intg.is_active ? 'Active' : 'Revoked'} · Created {formatLagosDate(intg.created_at)}
-                            {intg.expires_at ? ` · Expires ${formatLagosDate(intg.expires_at)}` : ''}
+                          <div className="text-[11px] text-slate-400">
+                            {sess.deviceSummary ? `${sess.deviceSummary} · ` : ''}
+                            Started {formatLagosDate(sess.createdAt)} · Expires {formatLagosDate(sess.expiresAt)}
                           </div>
                         </div>
-                        {Boolean(intg.is_active) && (
+                        {isOwner && (
                           <button
                             type="button"
-                            onClick={() => revokeIntegrationAccess(intg.id)}
+                            onClick={() => revokeSession(sess.id)}
                             className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
                           >
-                            Revoke Access
+                            Revoke
                           </button>
                         )}
                       </div>
@@ -1166,6 +1337,82 @@ export const AdminSettingsTab: React.FC<{
                   </div>
                 )}
               </div>
+
+              {isOwner && (
+                <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-4">
+                  <div className="flex items-center gap-2 text-base font-bold text-[#172554]">
+                    <KeyRound className="w-4 h-4" />
+                    <span>Authorized Technical Support Access</span>
+                  </div>
+                  <p className="text-slate-500">
+                    Issue revocable, read-scoped diagnostic access keys when granting troubleshooting permission.
+                    Technical error traces remain isolated from your store dashboard and customer orders.
+                  </p>
+
+                  {createdIntegrationKey && (
+                    <div className="rounded-xl bg-[#F5F7F4] border border-[#172554]/30 p-4 space-y-2">
+                      <div className="font-bold text-[#172554]">
+                        New Support Access Key (shown once only — store securely)
+                      </div>
+                      <div className="font-mono-tabular break-all bg-white border border-slate-200 rounded px-3 py-2 text-[#172554]">
+                        {createdIntegrationKey}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCreatedIntegrationKey(null)}
+                        className="text-[11px] font-semibold text-slate-600 underline"
+                      >
+                        Hide Key
+                      </button>
+                    </div>
+                  )}
+
+                  <form onSubmit={createIntegrationAccess} className="flex flex-wrap gap-2">
+                    <input
+                      type="text"
+                      required
+                      value={portalName}
+                      onChange={(e) => setPortalName(e.target.value)}
+                      placeholder="Authorized support team name"
+                      className="flex-1 min-w-[200px] rounded-lg border border-slate-300 px-3 py-2"
+                    />
+                    <button
+                      type="submit"
+                      className="rounded-lg bg-[#172554] px-4 py-2 font-bold text-[#B7F36B]"
+                    >
+                      Generate 90-Day Diagnostic Key
+                    </button>
+                  </form>
+
+                  {integrations.length > 0 && (
+                    <div className="divide-y divide-slate-100">
+                      {integrations.map((intg) => (
+                        <div key={intg.id} className="py-2.5 flex items-center justify-between gap-3">
+                          <div>
+                            <div className="font-semibold text-[#172554]">
+                              {intg.portal_name}{' '}
+                              <span className="font-mono-tabular text-slate-500">({intg.key_prefix}...)</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {intg.is_active ? 'Active' : 'Revoked'} · Created {formatLagosDate(intg.created_at)}
+                              {intg.expires_at ? ` · Expires ${formatLagosDate(intg.expires_at)}` : ''}
+                            </div>
+                          </div>
+                          {Boolean(intg.is_active) && (
+                            <button
+                              type="button"
+                              onClick={() => revokeIntegrationAccess(intg.id)}
+                              className="rounded border border-[#F47B68] px-2.5 py-1 text-[11px] font-semibold text-[#9A2E1E]"
+                            >
+                              Revoke Access
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div className="rounded-xl bg-white border border-slate-200 p-6 space-y-3">
@@ -1206,7 +1453,8 @@ export const AdminSettingsTab: React.FC<{
                             <span className="capitalize">{lg.outcome}</span>
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            {lg.device_summary} · {lg.approx_location || 'Location unavailable'}
+                            {lg.device_summary} · {lg.ip_address ? `${lg.ip_address} · ` : ''}
+                            {lg.approx_location || 'Location unavailable'}
                             {lg.is_new_device ? ' · New device' : ''}
                           </div>
                           <div className="text-[11px] text-slate-400">

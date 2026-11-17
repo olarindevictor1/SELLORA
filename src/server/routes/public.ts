@@ -7,6 +7,7 @@ import {
   getTrustedClientIp,
   isTurnstileConfigured,
 } from '../security';
+import { getAdminSessionSecurityState } from '../admin-security';
 import { getEffectiveSeoConfig } from '../seo';
 import { NIGERIAN_STATES_LGAS } from '../../shared/nigeria-locations';
 
@@ -36,12 +37,18 @@ export function createPublicRoutes() {
 
   app.get('/me', async (c) => {
     const user = c.get('user');
+    const db = c.get('db');
     const env = c.get('env');
     const turnstileEnabled = isTurnstileConfigured(env);
     const trimmedGa = (env.gaMeasurementId || '').trim();
     const gaValid = /^G-[A-Z0-9]{4,}$/i.test(trimmedGa) && !/^G-X+$/i.test(trimmedGa);
+    const adminSecurity =
+      user && user.role !== 'customer'
+        ? await getAdminSessionSecurityState(db, env, c.req.raw.headers, user)
+        : null;
     return c.json({
       user,
+      adminSecurity,
       capabilities: {
         googleOAuthEnabled: Boolean(env.googleClientId && env.googleClientSecret),
         turnstileEnabled,

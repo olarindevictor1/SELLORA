@@ -1,6 +1,6 @@
 # SELLORA — Known Issues & Verification Gaps
 
-**Last Updated:** 2026-11-15  
+**Last Updated:** 2026-11-17  
 **Source of Truth:** Direct read-only source inspection of `/app/applet`
 
 ---
@@ -18,6 +18,10 @@
 | **ISS-007** | **Medium** | `src/server/security.ts`, `orders.ts`, `admin.ts` | Added `validateUploadedFileBytes` (PNG/JPEG/WEBP/PDF/MP4 magic bytes + `<svg>`/`<html>`/`<script>` polyglot rejection) and `sanitizeUploadFilename`; receipts served with `Content-Disposition: attachment` + sandbox `CSP`. | Resolved Locally |
 | **ISS-008** | **Medium** | `src/server/routes/admin.ts` | Added Zod validation across remaining `admin.ts` write routes (`PATCH /orders/:id/status`, `/products/:id`, `/reviews/:id`, `/delivery-zones/:id`) and step-up `requireRecentAuthSession` on payouts/email/developer keys. | Resolved Locally |
 | **ISS-009** | **Medium** | `src/server/error-monitor.ts`, `app.ts`, `worker/index.ts`, `server.ts`, `email.ts` | Added Layer 3 private `error_monitoring_logs` (`ERR-XXXXXXXX`), secret redaction, 5-min deduplication, global `app.onError`, top-level Worker/Express error catchers, and sanitized `(Reference: ERR-...)` client display. | Resolved Locally |
+| **ISS-010** | **Medium** | `src/server/routes/admin.ts`, `src/components/admin/AdminCatalogTab.tsx` | `POST /api/admin/products` validates `sku` in Zod but unconditionally overwrites it with `generateAutoProductSku()`; no endpoints or UI exist yet for manual SKU entry, individual variant creation/editing (`POST /products/:id/variants`, `PATCH /variants/:id`), or DB-level case-insensitive & order-referenced SKU protection. | Open *(Specified in `0007` plan — Implementation Pending)* |
+| **ISS-011** | **High** | `src/server/login-monitor.ts`, `src/server/routes/admin.ts` | Device recognition (`computeDeviceHash`) relies solely on parsed browser+OS User-Agent string, and IP shifts do not trigger a strict lock. Unfamiliar device/IP admin logins currently issue an active session first and only send a post-login alert. | Open *(Specified in Strict Policy C — Implementation Pending)* |
+| **ISS-012** | **High** | `src/server/routes/security.ts` | `GET /api/security/login-response` immediately consumes single-use verification tokens on `GET`, leaving email approval/dispute links vulnerable to email security link-prefetch scanners. | Open *(Specified in Workflow D two-step `GET`->`POST` — Implementation Pending)* |
+| **ISS-013** | **Medium** | `src/server/routes/admin.ts`, `src/components/admin/AdminDashboard.tsx`, `AdminSettingsTab.tsx` | Admin Dashboard access lacks a separate secondary Admin Security Password gate and lacks UI panels for trusted device revocation or pending approval request management. | Open *(Specified in B & E — Implementation Pending)* |
 
 ---
 

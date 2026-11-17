@@ -16,11 +16,22 @@ import {
   triggerOrderNotifications,
 } from '../email';
 import {
+  checkPersistentRateLimit,
+  getTrustedClientIp,
   recordSecurityEvent,
   requireRecentAuthSession,
   validateUploadedFileBytes,
   writeAuditLog,
 } from '../security';
+import {
+  changeAdminSecurityPassword,
+  confirmAdminSecurityPasswordRecovery,
+  decidePendingApprovalById,
+  getAdminSessionSecurityState,
+  requestAdminSecurityPasswordRecovery,
+  setupAdminSecurityPassword,
+  verifyAdminSecurityPasswordForSession,
+} from '../admin-security';
 import { getEffectiveSeoConfig } from '../seo';
 import {
   ALL_PERMISSIONS,
@@ -63,8 +74,94 @@ function generateAutoVariantSku(productSku: string, index = 1): string {
   return `${productSku.toUpperCase()}-V${index}`;
 }
 
+function normalizeSkuInput(raw: string): string {
+  return raw.trim().toUpperCase().replace(/\s+/g, '-');
+}
+
+function validateManualSku(raw: string): { ok: true; sku: string } | { ok: false; error: string } {
+  const sku = normalizeSkuInput(raw);
+  if (!sku || sku.length < 2 || sku.length > 60) {
+    return { ok: false, error: 'SKU must be between 2 and 60 characters.' };
+  }
+  if (!/^[A-Z0-9][A-Z0-9._-]{1,59}$/.test(sku)) {
+    return {
+      ok: false,
+      error:
+        'SKU must start with a letter or number and contain only letters, numbers, dots, hyphens, or underscores.',
+    };
+  }
+  return { ok: true, sku };
+}
+
 export function createAdminRoutes() {
   const app = new Hono<AppContext>();
+
+  // Global fail-closed strict admin security middleware (Gmail device/IP gate + secondary Admin Security Password)
+  app.use('*', async (c, next) => {
+    const user = c.get('user');
+    if (!user) return c.json({ error: 'Authentication required' }, 401);
+    if (user.role === 'customer') return c.json({ error: 'Administrator access required' }, 403);
+
+    const db = c.get('db');
+    const env = c.get('env');
+    const subPath = c.req.path.replace(/^\/api\/admin/, '') || '/';
+    const secState = await getAdminSessionSecurityState(db, env, c.req.raw.headers, user);
+
+    if (subPath === '/security/status') {
+      return c.json({ adminSecurity: secState });
+    }
+
+    if (secState.lockCode === 'ADMIN_SECURITY_LOCKED') {
+      return c.json(
+        {
+          error:
+            'Administrative access is locked until this device and IP login request is approved via Gmail.',
+          code: 'ADMIN_SECURITY_LOCKED',
+          lockCode: 'ADMIN_SECURITY_LOCKED',
+          adminSecurity: secState,
+        },
+        423
+      );
+    }
+
+    if (secState.lockCode === 'ADMIN_SEC_PASSWORD_SETUP_REQUIRED') {
+      if (subPath === '/security/password/setup') {
+        await next();
+        return;
+      }
+      return c.json(
+        {
+          error: 'Please configure your separate Admin Security Password before accessing the dashboard.',
+          code: 'ADMIN_SEC_PASSWORD_SETUP_REQUIRED',
+          lockCode: 'ADMIN_SEC_PASSWORD_SETUP_REQUIRED',
+          adminSecurity: secState,
+        },
+        423
+      );
+    }
+
+    if (secState.lockCode === 'ADMIN_SEC_PASSWORD_REQUIRED') {
+      if (
+        subPath === '/security/password/verify' ||
+        subPath === '/security/password/recover/request' ||
+        subPath === '/security/password/recover/confirm'
+      ) {
+        await next();
+        return;
+      }
+      return c.json(
+        {
+          error: 'Enter your Admin Security Password to unlock administrative dashboard access.',
+          code: 'ADMIN_SEC_PASSWORD_REQUIRED',
+          lockCode: 'ADMIN_SEC_PASSWORD_REQUIRED',
+          adminSecurity: secState,
+        },
+        423
+      );
+    }
+
+    await next();
+  });
 
   // ==========================================
   // ANALYTICS & EXPENSES
@@ -1081,15 +1178,28 @@ export function createAdminRoutes() {
     const variants = await db.all<Record<string, unknown>>(
       `SELECT * FROM product_variants ORDER BY created_at ASC`
     );
+    const orderedProds = await db.all<{ product_id: string }>(
+      `SELECT DISTINCT product_id FROM order_items WHERE product_id IS NOT NULL`
+    );
+    const orderedVars = await db.all<{ variant_id: string }>(
+      `SELECT DISTINCT variant_id FROM order_items WHERE variant_id IS NOT NULL`
+    );
+    const orderedProdSet = new Set(orderedProds.map((r) => r.product_id));
+    const orderedVarSet = new Set(orderedVars.map((r) => r.variant_id));
+
     const varMap = new Map<string, Record<string, unknown>[]>();
     for (const v of variants) {
       const pid = String(v.product_id);
       if (!varMap.has(pid)) varMap.set(pid, []);
-      varMap.get(pid)!.push(v);
+      varMap.get(pid)!.push({
+        ...v,
+        hasOrderedItems: orderedVarSet.has(String(v.id)),
+      });
     }
     return c.json({
       products: products.map((p) => ({
         ...p,
+        hasOrderedItems: orderedProdSet.has(String(p.id)),
         media: JSON.parse(String(p.media_json || '[]')),
         specifications: JSON.parse(String(p.specifications_json || '[]')),
         variants: varMap.get(String(p.id)) || [],
@@ -1172,7 +1282,9 @@ export function createAdminRoutes() {
     const body = await c.req.json().catch(() => ({}));
     const schema = z.object({
       name: z.string().min(2).max(160),
+      skuMode: z.enum(['auto', 'manual']).optional(),
       sku: z.string().max(60).optional(),
+      variantSku: z.string().max(60).optional(),
       barcode: z.string().max(60).optional(),
       brand: z.string().max(80).optional(),
       shortDescription: z.string().max(300).optional(),
@@ -1198,6 +1310,31 @@ export function createAdminRoutes() {
     }
 
     const d = parsed.data;
+    const isManualMode =
+      d.skuMode === 'manual' || (d.skuMode === undefined && Boolean(d.sku && d.sku.trim().length > 0));
+
+    let manualProductSku = '';
+    let manualVariantSku = '';
+    if (isManualMode) {
+      const prodCheck = validateManualSku(d.sku || '');
+      if (!prodCheck.ok) {
+        return c.json({ error: prodCheck.error }, 400);
+      }
+      manualProductSku = prodCheck.sku;
+      if (d.variantSku && d.variantSku.trim().length > 0) {
+        const varCheck = validateManualSku(d.variantSku);
+        if (!varCheck.ok) {
+          return c.json({ error: `Variant ${varCheck.error}` }, 400);
+        }
+        manualVariantSku = varCheck.sku;
+      } else {
+        manualVariantSku = generateAutoVariantSku(manualProductSku, 1);
+      }
+      if (manualProductSku.toUpperCase() === manualVariantSku.toUpperCase()) {
+        return c.json({ error: 'Product SKU and initial variant SKU must be unique.', code: 'SKU_ALREADY_EXISTS' }, 409);
+      }
+    }
+
     const productId = `prod_${randomUuid()}`;
     const variantId = `var_${randomUuid()}`;
     const baseSlug = d.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'product';
@@ -1211,10 +1348,11 @@ export function createAdminRoutes() {
     let variantSku = '';
     let created = false;
     let lastError: unknown = null;
+    const maxAttempts = isManualMode ? 1 : 8;
 
-    for (let attempt = 0; attempt < 8; attempt++) {
-      productSku = generateAutoProductSku(d.name);
-      variantSku = generateAutoVariantSku(productSku, 1);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      productSku = isManualMode ? manualProductSku : generateAutoProductSku(d.name);
+      variantSku = isManualMode ? manualVariantSku : generateAutoVariantSku(productSku, 1);
       const slug = `${baseSlug}-${randomHex(2)}`;
 
       try {
@@ -1275,7 +1413,17 @@ export function createAdminRoutes() {
         break;
       } catch (err) {
         lastError = err;
-        if (isUniqueConstraintError(err)) {
+        const guard = extractDbGuardCode(err);
+        if (guard === 'SKU_ALREADY_EXISTS' || isUniqueConstraintError(err)) {
+          if (isManualMode) {
+            return c.json(
+              {
+                error: 'SKU is already assigned to an existing product or variant.',
+                code: 'SKU_ALREADY_EXISTS',
+              },
+              409
+            );
+          }
           continue;
         }
         return c.json({ error: 'Unable to create product.' }, 400);
@@ -1283,8 +1431,8 @@ export function createAdminRoutes() {
     }
 
     if (!created) {
-      if (isUniqueConstraintError(lastError)) {
-        return c.json({ error: 'Unable to allocate a unique product SKU. Please retry.' }, 409);
+      if (extractDbGuardCode(lastError) === 'SKU_ALREADY_EXISTS' || isUniqueConstraintError(lastError)) {
+        return c.json({ error: 'Unable to allocate a unique product SKU. Please retry.', code: 'SKU_ALREADY_EXISTS' }, 409);
       }
       return c.json({ error: 'Unable to create product.' }, 400);
     }
@@ -1296,10 +1444,10 @@ export function createAdminRoutes() {
       action: 'PRODUCT_CREATED',
       targetType: 'product',
       targetId: productId,
-      details: { name: d.name, sku: productSku },
+      details: { name: d.name, sku: productSku, skuMode: isManualMode ? 'manual' : 'auto' },
     });
 
-    return c.json({ ok: true, id: productId, sku: productSku, variantSku }, 201);
+    return c.json({ ok: true, id: productId, variantId, sku: productSku, variantSku }, 201);
   });
 
   app.patch('/products/:id', requirePerm('products:write'), async (c) => {
@@ -1309,6 +1457,7 @@ export function createAdminRoutes() {
     const rawBody = await c.req.json().catch(() => ({}));
     const patchSchema = z.object({
       name: z.string().min(1).max(160).optional(),
+      sku: z.string().max(60).optional(),
       shortDescription: z.string().max(400).optional(),
       description: z.string().max(10000).optional(),
       categoryId: z.string().max(100).nullable().optional(),
@@ -1333,7 +1482,34 @@ export function createAdminRoutes() {
     const body = parsedPatch.data;
     const now = new Date().toISOString();
 
-    // SKUs are immutable once generated; ignore any client-supplied sku field
+    const existingProd = await db.get<{ id: string; sku: string }>(
+      `SELECT id, sku FROM products WHERE id = ?`,
+      [id]
+    );
+    if (!existingProd) return c.json({ error: 'Product not found' }, 404);
+
+    let nextSku: string | null = null;
+    if (body.sku !== undefined) {
+      const check = validateManualSku(body.sku);
+      if (!check.ok) return c.json({ error: check.error }, 400);
+      if (check.sku !== String(existingProd.sku).toUpperCase()) {
+        const refOrder = await db.get<{ hit: number }>(
+          `SELECT 1 as hit FROM order_items WHERE product_id = ? LIMIT 1`,
+          [id]
+        );
+        if (refOrder) {
+          return c.json(
+            {
+              error: 'Cannot modify SKU because this product is already referenced by existing orders.',
+              code: 'SKU_REFERENCED_BY_ORDER',
+            },
+            409
+          );
+        }
+        nextSku = check.sku;
+      }
+    }
+
     const priceKobo = body.priceNaira !== undefined ? Math.round(Number(body.priceNaira) * 100) : null;
     const salePriceKobo =
       body.salePriceNaira === null
@@ -1352,6 +1528,7 @@ export function createAdminRoutes() {
       {
         sql: `UPDATE products SET
           name = COALESCE(?, name),
+          sku = COALESCE(?, sku),
           short_description = COALESCE(?, short_description),
           description = COALESCE(?, description),
           category_id = COALESCE(?, category_id),
@@ -1370,6 +1547,7 @@ export function createAdminRoutes() {
         WHERE id = ?`,
         params: [
           body.name !== undefined ? String(body.name).trim() : null,
+          nextSku,
           body.shortDescription ?? null,
           body.description ?? null,
           body.categoryId !== undefined ? body.categoryId : null,
@@ -1409,7 +1587,27 @@ export function createAdminRoutes() {
       });
     }
 
-    await db.batch(updateBatch);
+    try {
+      await db.batch(updateBatch);
+    } catch (err) {
+      const guard = extractDbGuardCode(err);
+      if (guard === 'SKU_REFERENCED_BY_ORDER') {
+        return c.json(
+          {
+            error: 'Cannot modify SKU because this product is already referenced by existing orders.',
+            code: 'SKU_REFERENCED_BY_ORDER',
+          },
+          409
+        );
+      }
+      if (guard === 'SKU_ALREADY_EXISTS' || isUniqueConstraintError(err)) {
+        return c.json(
+          { error: 'SKU is already assigned to another product or variant.', code: 'SKU_ALREADY_EXISTS' },
+          409
+        );
+      }
+      throw err;
+    }
 
     await writeAuditLog(db, {
       actorId: user.id,
@@ -1418,8 +1616,236 @@ export function createAdminRoutes() {
       action: 'PRODUCT_UPDATED',
       targetType: 'product',
       targetId: id,
+      details: nextSku ? { previousSku: existingProd.sku, newSku: nextSku } : undefined,
     });
-    return c.json({ ok: true });
+    return c.json({ ok: true, sku: nextSku || existingProd.sku });
+  });
+
+  app.post('/products/:id/variants', requirePerm('products:write'), async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const productId = c.req.param('id');
+    const parent = await db.get<{
+      id: string;
+      sku: string;
+      price_kobo: number;
+      sale_price_kobo: number | null;
+      cost_price_kobo: number | null;
+    }>(`SELECT id, sku, price_kobo, sale_price_kobo, cost_price_kobo FROM products WHERE id = ?`, [
+      productId,
+    ]);
+    if (!parent) return c.json({ error: 'Product not found' }, 404);
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      name: z.string().min(1).max(100),
+      skuMode: z.enum(['auto', 'manual']).optional(),
+      sku: z.string().max(60).optional(),
+      priceNaira: z.number().nonnegative().optional(),
+      salePriceNaira: z.number().nonnegative().nullable().optional(),
+      costPriceNaira: z.number().nonnegative().nullable().optional(),
+      stockQuantity: z.number().int().min(0).default(0),
+      attributes: z.record(z.string(), z.string()).optional(),
+    });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid variant payload' }, 400);
+    }
+
+    const d = parsed.data;
+    const isManual =
+      d.skuMode === 'manual' || (d.skuMode === undefined && Boolean(d.sku && d.sku.trim().length > 0));
+    let manualSku = '';
+    if (isManual) {
+      const check = validateManualSku(d.sku || '');
+      if (!check.ok) return c.json({ error: check.error }, 400);
+      manualSku = check.sku;
+    }
+
+    const existingCountRow = await db.get<{ cnt: number }>(
+      `SELECT COUNT(*) as cnt FROM product_variants WHERE product_id = ?`,
+      [productId]
+    );
+    const startIdx = Number(existingCountRow?.cnt || 0) + 1;
+    const variantId = `var_${randomUuid()}`;
+    const now = new Date().toISOString();
+    const priceKobo = d.priceNaira !== undefined ? Math.round(d.priceNaira * 100) : parent.price_kobo;
+    const salePriceKobo =
+      d.salePriceNaira === null
+        ? null
+        : d.salePriceNaira !== undefined
+          ? Math.round(d.salePriceNaira * 100)
+          : parent.sale_price_kobo;
+    const costPriceKobo =
+      d.costPriceNaira === null
+        ? null
+        : d.costPriceNaira !== undefined
+          ? Math.round(d.costPriceNaira * 100)
+          : parent.cost_price_kobo;
+
+    const maxAttempts = isManual ? 1 : 8;
+    let chosenSku = '';
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      chosenSku = isManual
+        ? manualSku
+        : attempt === 0
+          ? `${String(parent.sku).toUpperCase()}-V${startIdx}`
+          : `${String(parent.sku).toUpperCase()}-V${startIdx}-${randomHex(2).toUpperCase()}`;
+      try {
+        await db.run(
+          `INSERT INTO product_variants (
+            id, product_id, name, sku, attributes_json, price_kobo, sale_price_kobo,
+            cost_price_kobo, stock_quantity, reserved_quantity, is_active, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)`,
+          [
+            variantId,
+            productId,
+            d.name.trim(),
+            chosenSku,
+            JSON.stringify(d.attributes || { Variant: d.name.trim() }),
+            priceKobo,
+            salePriceKobo,
+            costPriceKobo,
+            d.stockQuantity,
+            now,
+          ]
+        );
+        await writeAuditLog(db, {
+          actorId: user.id,
+          actorEmail: user.email,
+          actorRole: user.role,
+          action: 'VARIANT_CREATED',
+          targetType: 'product_variant',
+          targetId: variantId,
+          details: { productId, sku: chosenSku, skuMode: isManual ? 'manual' : 'auto' },
+        });
+        return c.json({ ok: true, id: variantId, sku: chosenSku }, 201);
+      } catch (err) {
+        const guard = extractDbGuardCode(err);
+        if (guard === 'SKU_ALREADY_EXISTS' || isUniqueConstraintError(err)) {
+          if (isManual) {
+            return c.json(
+              { error: 'Variant SKU is already in use by another product or variant.', code: 'SKU_ALREADY_EXISTS' },
+              409
+            );
+          }
+          continue;
+        }
+        return c.json({ error: 'Unable to create product variant.' }, 400);
+      }
+    }
+    return c.json({ error: 'Unable to allocate a unique variant SKU.', code: 'SKU_ALREADY_EXISTS' }, 409);
+  });
+
+  app.patch('/variants/:id', requirePerm('products:write'), async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const variantId = c.req.param('id');
+    const existing = await db.get<{ id: string; product_id: string; sku: string; name: string }>(
+      `SELECT id, product_id, sku, name FROM product_variants WHERE id = ?`,
+      [variantId]
+    );
+    if (!existing) return c.json({ error: 'Variant not found' }, 404);
+
+    const rawBody = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      name: z.string().min(1).max(100).optional(),
+      sku: z.string().max(60).optional(),
+      priceNaira: z.number().nonnegative().optional(),
+      salePriceNaira: z.number().nonnegative().nullable().optional(),
+      costPriceNaira: z.number().nonnegative().nullable().optional(),
+      isActive: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid variant update' }, 400);
+    }
+
+    const d = parsed.data;
+    let nextSku: string | null = null;
+    if (d.sku !== undefined) {
+      const check = validateManualSku(d.sku);
+      if (!check.ok) return c.json({ error: check.error }, 400);
+      if (check.sku !== String(existing.sku).toUpperCase()) {
+        const refOrder = await db.get<{ hit: number }>(
+          `SELECT 1 as hit FROM order_items WHERE variant_id = ? LIMIT 1`,
+          [variantId]
+        );
+        if (refOrder) {
+          return c.json(
+            {
+              error: 'Cannot modify SKU because this variant is already referenced by existing orders.',
+              code: 'SKU_REFERENCED_BY_ORDER',
+            },
+            409
+          );
+        }
+        nextSku = check.sku;
+      }
+    }
+
+    const priceKobo = d.priceNaira !== undefined ? Math.round(d.priceNaira * 100) : null;
+    const salePriceKobo =
+      d.salePriceNaira === null ? null : d.salePriceNaira !== undefined ? Math.round(d.salePriceNaira * 100) : undefined;
+    const costPriceKobo =
+      d.costPriceNaira === null ? null : d.costPriceNaira !== undefined ? Math.round(d.costPriceNaira * 100) : undefined;
+
+    const batch: BatchStatement[] = [
+      {
+        sql: `UPDATE product_variants SET
+          name = COALESCE(?, name),
+          sku = COALESCE(?, sku),
+          price_kobo = COALESCE(?, price_kobo),
+          is_active = COALESCE(?, is_active)
+        WHERE id = ?`,
+        params: [
+          d.name ? d.name.trim() : null,
+          nextSku,
+          priceKobo,
+          d.isActive !== undefined ? (d.isActive ? 1 : 0) : null,
+          variantId,
+        ],
+      },
+    ];
+    if (salePriceKobo !== undefined) {
+      batch.push({ sql: `UPDATE product_variants SET sale_price_kobo = ? WHERE id = ?`, params: [salePriceKobo, variantId] });
+    }
+    if (costPriceKobo !== undefined) {
+      batch.push({ sql: `UPDATE product_variants SET cost_price_kobo = ? WHERE id = ?`, params: [costPriceKobo, variantId] });
+    }
+
+    try {
+      await db.batch(batch);
+    } catch (err) {
+      const guard = extractDbGuardCode(err);
+      if (guard === 'SKU_REFERENCED_BY_ORDER') {
+        return c.json(
+          {
+            error: 'Cannot modify SKU because this variant is already referenced by existing orders.',
+            code: 'SKU_REFERENCED_BY_ORDER',
+          },
+          409
+        );
+      }
+      if (guard === 'SKU_ALREADY_EXISTS' || isUniqueConstraintError(err)) {
+        return c.json(
+          { error: 'SKU is already assigned to another product or variant.', code: 'SKU_ALREADY_EXISTS' },
+          409
+        );
+      }
+      throw err;
+    }
+
+    await writeAuditLog(db, {
+      actorId: user.id,
+      actorEmail: user.email,
+      actorRole: user.role,
+      action: 'VARIANT_UPDATED',
+      targetType: 'product_variant',
+      targetId: variantId,
+      details: nextSku ? { previousSku: existing.sku, newSku: nextSku } : undefined,
+    });
+    return c.json({ ok: true, sku: nextSku || existing.sku });
   });
 
   app.post('/products/:id/duplicate', requirePerm('products:write'), async (c) => {
@@ -2974,6 +3400,381 @@ export function createAdminRoutes() {
         ? 'Confirmation link sent to your current login email. After confirming, verify the new email link to finalize the change.'
         : 'Verification link sent to the new login email. Complete verification to finalize the change.',
     });
+  });
+
+  // ==========================================
+  // STRICT ADMIN SECURITY PASSWORD & TRUSTED DEVICE MANAGEMENT
+  // ==========================================
+  app.post('/security/password/setup', async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+
+    const recent = await requireRecentAuthSession(db, c.req.raw.headers);
+    if (!recent) {
+      return c.json(
+        { error: 'Please sign in again before configuring your Admin Security Password.' },
+        403
+      );
+    }
+
+    const secState = await getAdminSessionSecurityState(db, env, c.req.raw.headers, user);
+    if (!secState.sessionId) {
+      return c.json({ error: 'Active session required.' }, 401);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({ newPassword: z.string().min(8).max(128) });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid password input.' }, 400);
+    }
+
+    const res = await setupAdminSecurityPassword(db, env, {
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      sessionId: secState.sessionId,
+      newPassword: parsed.data.newPassword,
+      ip,
+    });
+    return c.json(res, res.status as 201);
+  });
+
+  app.post('/security/password/verify', async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+
+    const secState = await getAdminSessionSecurityState(db, env, c.req.raw.headers, user);
+    if (!secState.sessionId) {
+      return c.json({ error: 'Active session required.' }, 401);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({ password: z.string().min(1).max(128) });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: 'Admin Security Password is required.' }, 400);
+    }
+
+    const res = await verifyAdminSecurityPasswordForSession(db, env, {
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      sessionId: secState.sessionId,
+      password: parsed.data.password,
+      ip,
+    });
+    if (res.status === 429 && res.retryAfterSec) {
+      return c.json(res, 429, { 'Retry-After': String(res.retryAfterSec) });
+    }
+    return c.json(res, res.status as 200);
+  });
+
+  app.post('/security/password/change', async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+
+    const secState = await getAdminSessionSecurityState(db, env, c.req.raw.headers, user);
+    if (!secState.sessionId || !secState.unlocked) {
+      return c.json({ error: 'Unlocked administrative session required.' }, 423);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      currentPassword: z.string().min(1).max(128),
+      newPassword: z.string().min(8).max(128),
+    });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid password payload.' }, 400);
+    }
+
+    const res = await changeAdminSecurityPassword(db, env, {
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      sessionId: secState.sessionId,
+      currentPassword: parsed.data.currentPassword,
+      newPassword: parsed.data.newPassword,
+      ip,
+    });
+    return c.json(res, res.status as 200);
+  });
+
+  app.post('/security/password/recover/request', async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+
+    const rl = await checkPersistentRateLimit(db, `sec_rec_req:${user.id}:${ip}`, 5, 15 * 60_000);
+    if (!rl.allowed) {
+      return c.json(
+        { error: 'Too many recovery requests. Please wait before requesting another token.' },
+        429,
+        { 'Retry-After': String(rl.retryAfterSec) }
+      );
+    }
+
+    const res = await requestAdminSecurityPasswordRecovery(db, env, {
+      userId: user.id,
+      userEmail: user.email,
+      userName: user.name,
+      ip,
+    });
+    return c.json(res, res.status as 200);
+  });
+
+  app.post('/security/password/recover/confirm', async (c) => {
+    const user = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+
+    const rl = await checkPersistentRateLimit(db, `sec_rec_conf:${user.id}:${ip}`, 10, 15 * 60_000);
+    if (!rl.allowed) {
+      return c.json(
+        { error: 'Too many recovery attempts. Please wait before trying again.' },
+        429,
+        { 'Retry-After': String(rl.retryAfterSec) }
+      );
+    }
+
+    const secState = await getAdminSessionSecurityState(db, env, c.req.raw.headers, user);
+    if (!secState.sessionId) {
+      return c.json({ error: 'Active session required.' }, 401);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({
+      recoveryTokenOrCode: z.string().min(6).max(200),
+      newPassword: z.string().min(8).max(128),
+    });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid recovery payload.' }, 400);
+    }
+
+    const res = await confirmAdminSecurityPasswordRecovery(db, env, {
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      sessionId: secState.sessionId,
+      recoveryTokenOrCode: parsed.data.recoveryTokenOrCode,
+      newPassword: parsed.data.newPassword,
+      ip,
+    });
+    return c.json(res, res.status as 200);
+  });
+
+  app.get('/security/overview', async (c) => {
+    const actor = c.get('user')!;
+    const db = c.get('db');
+    const isOwner = actor.role === 'owner';
+
+    const trustedDevices = await db.all<{
+      id: string;
+      user_id: string;
+      user_email: string;
+      device_label: string;
+      trusted_ip: string;
+      approx_location: string | null;
+      is_active: number;
+      approved_via: string;
+      first_seen_at: string;
+      last_seen_at: string;
+      revoked_at: string | null;
+    }>(
+      isOwner
+        ? `SELECT td.id, td.user_id, u.email as user_email, td.device_label, td.trusted_ip, td.approx_location,
+                  td.is_active, td.approved_via, td.first_seen_at, td.last_seen_at, td.revoked_at
+           FROM admin_trusted_devices td
+           JOIN user u ON u.id = td.user_id
+           ORDER BY td.is_active DESC, td.last_seen_at DESC LIMIT 40`
+        : `SELECT td.id, td.user_id, u.email as user_email, td.device_label, td.trusted_ip, td.approx_location,
+                  td.is_active, td.approved_via, td.first_seen_at, td.last_seen_at, td.revoked_at
+           FROM admin_trusted_devices td
+           JOIN user u ON u.id = td.user_id
+           WHERE td.user_id = ?
+           ORDER BY td.is_active DESC, td.last_seen_at DESC LIMIT 30`,
+      isOwner ? [] : [actor.id]
+    );
+
+    const pendingApprovals = await db.all<{
+      id: string;
+      session_id: string;
+      user_id: string;
+      user_email: string;
+      event_ref: string | null;
+      trigger_reason: string;
+      device_summary: string;
+      ip_address: string;
+      approx_location: string | null;
+      status: string;
+      expires_at: string;
+      decided_at: string | null;
+      decided_by: string | null;
+      created_at: string;
+    }>(
+      isOwner
+        ? `SELECT a.id, a.session_id, a.user_id, u.email as user_email, a.event_ref, a.trigger_reason,
+                  a.device_summary, a.ip_address, a.approx_location, a.status, a.expires_at,
+                  a.decided_at, a.decided_by, a.created_at
+           FROM admin_login_approvals a
+           JOIN user u ON u.id = a.user_id
+           ORDER BY CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 30`
+        : `SELECT a.id, a.session_id, a.user_id, u.email as user_email, a.event_ref, a.trigger_reason,
+                  a.device_summary, a.ip_address, a.approx_location, a.status, a.expires_at,
+                  a.decided_at, a.decided_by, a.created_at
+           FROM admin_login_approvals a
+           JOIN user u ON u.id = a.user_id
+           WHERE a.user_id = ?
+           ORDER BY CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 20`,
+      isOwner ? [] : [actor.id]
+    );
+
+    const recentLogins = await db.all(
+      isOwner
+        ? `SELECT id, email, auth_method, outcome, is_new_device, is_unusual, device_summary,
+                  ip_address, approx_location, created_at
+           FROM login_history ORDER BY created_at DESC LIMIT 30`
+        : `SELECT id, email, auth_method, outcome, is_new_device, is_unusual, device_summary,
+                  ip_address, approx_location, created_at
+           FROM login_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`,
+      isOwner ? [] : [actor.id]
+    );
+
+    const securityEvents = isOwner
+      ? await db.all(
+          `SELECT id, event_ref, email, event_category, severity, approx_location, device_summary,
+                  risk_level, status, created_at, resolved_at
+           FROM security_events ORDER BY created_at DESC LIMIT 30`
+        )
+      : await db.all(
+          `SELECT id, event_ref, email, event_category, severity, approx_location, device_summary,
+                  risk_level, status, created_at, resolved_at
+           FROM security_events WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`,
+          [actor.id]
+        );
+
+    return c.json({
+      trustedDevices,
+      pendingApprovals,
+      recentLogins,
+      securityEvents,
+    });
+  });
+
+  app.delete('/security/devices/:id', async (c) => {
+    const actor = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const deviceId = c.req.param('id');
+
+    const dev = await db.get<{
+      id: string;
+      user_id: string;
+      device_token_hash: string;
+      trusted_ip: string;
+      device_label: string;
+      is_active: number;
+    }>(`SELECT * FROM admin_trusted_devices WHERE id = ?`, [deviceId]);
+
+    if (!dev) return c.json({ error: 'Trusted device record not found.' }, 404);
+    if (actor.role !== 'owner' && dev.user_id !== actor.id) {
+      return c.json({ error: 'Only the store owner can revoke another administrator device.' }, 403);
+    }
+
+    const now = new Date().toISOString();
+    const affectedSessions = await db.all<{ session_id: string }>(
+      `SELECT session_id FROM admin_session_verifications
+       WHERE user_id = ? AND bound_device_token_hash = ? AND bound_ip = ?`,
+      [dev.user_id, dev.device_token_hash, dev.trusted_ip]
+    );
+
+    const batch: BatchStatement[] = [
+      {
+        sql: `UPDATE admin_trusted_devices
+              SET is_active = 0, revoked_at = ?, revoked_by = ?
+              WHERE id = ?`,
+        params: [now, actor.id, deviceId],
+      },
+      {
+        sql: `UPDATE admin_session_verifications
+              SET device_approval_status = 'rejected',
+                  sec_password_verified_at = NULL,
+                  sec_password_expires_at = NULL,
+                  updated_at = ?
+              WHERE user_id = ? AND bound_device_token_hash = ? AND bound_ip = ?`,
+        params: [now, dev.user_id, dev.device_token_hash, dev.trusted_ip],
+      },
+    ];
+    for (const s of affectedSessions) {
+      batch.push({
+        sql: `DELETE FROM session WHERE id = ?`,
+        params: [s.session_id],
+      });
+    }
+    await db.batch(batch);
+
+    await writeAuditLog(db, {
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      action: 'ADMIN_TRUSTED_DEVICE_REVOKED',
+      targetType: 'admin_trusted_device',
+      targetId: deviceId,
+      details: {
+        targetUserId: dev.user_id,
+        trustedIp: dev.trusted_ip,
+        deviceLabel: dev.device_label,
+        terminatedSessions: affectedSessions.length,
+      },
+      ipAddress: ip,
+    });
+
+    await recordSecurityEvent(db, {
+      userId: dev.user_id,
+      email: actor.email,
+      eventCategory: 'admin_trusted_device_revoked',
+      severity: 'high',
+      riskLevel: 'low',
+      status: 'resolved',
+      ipAddress: ip,
+      metadata: { deviceId, trustedIp: dev.trusted_ip },
+    });
+
+    return c.json({ ok: true, terminatedSessions: affectedSessions.length });
+  });
+
+  app.post('/security/approvals/:id/decide', async (c) => {
+    const actor = c.get('user')!;
+    const db = c.get('db');
+    const env = c.get('env');
+    const ip = getTrustedClientIp(c.req.raw.headers, env);
+    const approvalId = c.req.param('id');
+
+    const body = await c.req.json().catch(() => ({}));
+    const schema = z.object({ action: z.enum(['approve', 'reject']) });
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) return c.json({ error: 'Action must be approve or reject.' }, 400);
+
+    const res = await decidePendingApprovalById(db, env, {
+      approvalId,
+      action: parsed.data.action,
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      ip,
+    });
+    return c.json(res, res.status as 200);
   });
 
   return app;

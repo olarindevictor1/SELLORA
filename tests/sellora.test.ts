@@ -72,9 +72,96 @@ function createTestRuntime(envOverrides: Partial<AppEnvConfig> = {}) {
   return { app, db, auth, storage, env, tmpDir };
 }
 
+function extractCookieHeader(res: Response): string {
+  const anyHeaders = res.headers as unknown as { getSetCookie?: () => string[] };
+  const rawList =
+    typeof anyHeaders.getSetCookie === 'function'
+      ? anyHeaders.getSetCookie()
+      : (res.headers.get('set-cookie') || '').split(/,(?=\s*[a-zA-Z0-9_.-]+=)/);
+  return rawList
+    .map((entry) => entry.split(';')[0].trim())
+    .filter(Boolean)
+    .join('; ');
+}
+
+async function unlockPrivilegedSession(
+  rt: { app?: any; db: { get: <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T | null> } },
+  signInRes: Response,
+  opts: {
+    baseUrl?: string;
+    secPassword?: string;
+    dispatch?: (url: string, init?: RequestInit) => Promise<Response>;
+  } = {}
+): Promise<string> {
+  const baseUrl = (opts.baseUrl || 'http://localhost:3000').replace(/\/+$/, '');
+  const secPassword = opts.secPassword || 'AdminSecPass#2026!';
+  const dispatch =
+    opts.dispatch ||
+    ((url: string, init?: RequestInit) => rt.app.request(url, init) as Promise<Response>);
+  const cookieHeader = extractCookieHeader(signInRes);
+  assert.ok(cookieHeader, 'Expected session cookie header from privileged sign-in');
+
+  const status1Res = await dispatch(`${baseUrl}/api/admin/security/status`, {
+    headers: { Cookie: cookieHeader },
+  });
+  assert.equal(status1Res.status, 200);
+  const status1Body = (await status1Res.json()) as {
+    adminSecurity: {
+      required: boolean;
+      unlocked: boolean;
+      lockCode: string | null;
+    };
+  };
+  let statusJson = status1Body.adminSecurity;
+
+  if (statusJson.required && statusJson.lockCode === 'ADMIN_SECURITY_LOCKED') {
+    const mailRow = await rt.db.get<{ html_body: string }>(
+      `SELECT html_body FROM email_notification_events
+       WHERE notification_type = 'security_admin_approval_required'
+       ORDER BY created_at DESC LIMIT 1`
+    );
+    assert.ok(mailRow?.html_body, 'Expected Gmail security approval email in Brevo outbox');
+    const tokenMatch = mailRow.html_body.match(/action=approve(?:&amp;|&)token=([A-Za-z0-9_-]+)/);
+    assert.ok(tokenMatch?.[1], 'Expected approve token URL in approval email body');
+
+    const apvRes = await dispatch(`${baseUrl}/api/security/admin-approval`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'approve', token: tokenMatch[1] }),
+    });
+    assert.equal(apvRes.status, 200);
+
+    const status2Res = await dispatch(`${baseUrl}/api/admin/security/status`, {
+      headers: { Cookie: cookieHeader },
+    });
+    assert.equal(status2Res.status, 200);
+    statusJson = ((await status2Res.json()) as { adminSecurity: typeof statusJson }).adminSecurity;
+  }
+
+  if (statusJson.required && !statusJson.unlocked) {
+    if (statusJson.lockCode === 'ADMIN_SEC_PASSWORD_SETUP_REQUIRED') {
+      const setupRes = await dispatch(`${baseUrl}/api/admin/security/password/setup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieHeader },
+        body: JSON.stringify({ newPassword: secPassword }),
+      });
+      assert.ok(setupRes.status === 200 || setupRes.status === 201);
+    } else if (statusJson.lockCode === 'ADMIN_SEC_PASSWORD_REQUIRED') {
+      const verifyRes = await dispatch(`${baseUrl}/api/admin/security/password/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieHeader },
+        body: JSON.stringify({ password: secPassword }),
+      });
+      assert.equal(verifyRes.status, 200);
+    }
+  }
+
+  return cookieHeader;
+}
+
 async function provisionAndSignInOwner(
   rt: { app: any; db: any },
-  opts: { name?: string; email?: string; password?: string } = {}
+  opts: { name?: string; email?: string; password?: string; secPassword?: string } = {}
 ): Promise<{ cookie: string; userId: string }> {
   const email = (opts.email || 'olarindevictor046@gmail.com').trim().toLowerCase();
   const password = opts.password || 'StrongOwnerPassword123!';
@@ -89,7 +176,7 @@ async function provisionAndSignInOwner(
     body: JSON.stringify({ email, password }),
   });
   assert.equal(res.status, 200);
-  const cookie = res.headers.get('set-cookie')!.split(';')[0];
+  const cookie = await unlockPrivilegedSession(rt, res, { secPassword: opts.secPassword });
   return { cookie, userId: prov.userId };
 }
 
@@ -588,14 +675,14 @@ test('RBAC role isolation across owner, admin, staff, and customer', async () =>
     });
     assert.equal(createStaff.status, 201);
 
-    // Sign in as Admin and Staff
+    // Sign in as Admin and Staff (unlocking strict device approval + secondary security password)
     const adminSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'admin@sellora.test', password: 'AdminPassword123!' }),
     });
     assert.equal(adminSignIn.status, 200);
-    const adminCookie = adminSignIn.headers.get('set-cookie')!.split(';')[0];
+    const adminCookie = await unlockPrivilegedSession(rt, adminSignIn);
 
     const staffSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
       method: 'POST',
@@ -603,7 +690,7 @@ test('RBAC role isolation across owner, admin, staff, and customer', async () =>
       body: JSON.stringify({ email: 'staff@sellora.test', password: 'StaffPassword123!' }),
     });
     assert.equal(staffSignIn.status, 200);
-    const staffCookie = staffSignIn.headers.get('set-cookie')!.split(';')[0];
+    const staffCookie = await unlockPrivilegedSession(rt, staffSignIn);
 
     // Owner allowed on owner-only endpoints
     assert.equal((await rt.app.request('http://localhost:3000/api/admin/staff', { headers: { Cookie: ownerCookie } })).status, 200);
@@ -2484,7 +2571,7 @@ test('Automatic SKU generation assigns unique SKUs on create/duplicate, handles 
     assert.equal(dbProd?.sku, created.sku);
     assert.equal(dbVar?.sku, created.variantSku);
 
-    // 2. Concurrent creation of 8 identically named products -> all SKUs unique with zero collisions
+    // 2. Concurrent creation of 8 identically named products in auto SKU mode -> all SKUs unique with zero collisions
     type CreatedSku = { id: string; sku: string; variantSku: string };
     const concurrentReqs: Array<Promise<CreatedSku>> = Array.from({ length: 8 }, async (_, idx) => {
       const r = await fx.app.request('http://localhost:3000/api/admin/products', {
@@ -2492,7 +2579,8 @@ test('Automatic SKU generation assigns unique SKUs on create/duplicate, handles 
         headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
         body: JSON.stringify({
           name: 'Identical Ceramic Vase',
-          sku: 'ATTEMPTED-MANUAL-OVERRIDE', // ignored by backend
+          skuMode: 'auto',
+          sku: 'ATTEMPTED-MANUAL-OVERRIDE', // ignored when skuMode === 'auto'
           priceNaira: 25000 + idx * 100,
           stockQuantity: 5,
         }),
@@ -2506,13 +2594,12 @@ test('Automatic SKU generation assigns unique SKUs on create/duplicate, handles 
     assert.equal(varSkuSet.size, 8);
     assert.ok(!skuSet.has('ATTEMPTED-MANUAL-OVERRIDE'));
 
-    // 3. Edit product (even with sku field in payload) -> preserves original SKU and never regenerates it
+    // 3. Edit product details (without changing SKU) -> preserves original SKU and never regenerates it
     const editRes = await fx.app.request(`http://localhost:3000/api/admin/products/${created.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', Cookie: fx.ownerCookie },
       body: JSON.stringify({
         name: 'Kano Brass Desk Organizer Pro',
-        sku: 'SHOULD-BE-IGNORED-999',
         priceNaira: 52000,
       }),
     });
@@ -2599,7 +2686,7 @@ test('Public API responses, notification errors, and role permissions enforce st
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'manager@sellora.test', password: 'ManagerPassword123!' }),
     });
-    const staffCookie = staffLogin.headers.get('set-cookie')!.split(';')[0];
+    const staffCookie = await unlockPrivilegedSession(fx, staffLogin);
 
     for (const restrictedPath of ['/api/admin/staff', '/api/admin/sessions', '/api/admin/audit-logs']) {
       const r = await fx.app.request(`http://localhost:3000${restrictedPath}`, {
@@ -3446,7 +3533,7 @@ test('Admin Login Email Change (olarindevictor3@gmail.com -> olarindevictor046@g
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'staff.admin@sellora.test', password: 'StaffPassword123!' }),
     });
-    const staffCookie = staffSignIn.headers.get('set-cookie')!.split(';')[0];
+    const staffCookie = await unlockPrivilegedSession(rt, staffSignIn);
 
     // 1. Pre-migration hijack protections: customer signup & OAuth create for olarindevictor046@gmail.com rejected while owner exists
     const hijackSignup = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
@@ -3583,7 +3670,7 @@ test('Admin Login Email Change (olarindevictor3@gmail.com -> olarindevictor046@g
       }),
     });
     assert.equal(newLoginRes.status, 200);
-    const newOwnerCookie = newLoginRes.headers.get('set-cookie')!.split(';')[0];
+    const newOwnerCookie = await unlockPrivilegedSession(rt, newLoginRes);
 
     // Preserved store orders, audit logs, and emailMigrationPending === false
     const orderCheck = await (
@@ -4137,13 +4224,31 @@ test('Cloudflare Worker runtime routes all DB & media operations through D1 and 
     workerEnv
   );
   assert.equal(signInRes.status, 200);
-  const ownerCookie = signInRes.headers.get('set-cookie')!.split(';')[0];
+  const rawWorkerCookie = extractCookieHeader(signInRes);
 
   const unauthInfraRes = await workerEntry.fetch(
     new Request('https://sellora-commerce.example.workers.dev/api/admin/infrastructure-status'),
     workerEnv
   );
   assert.equal(unauthInfraRes.status, 401);
+
+  // Strict admin security blocks access until Gmail approval + scrypt secondary password
+  const lockedInfraRes = await workerEntry.fetch(
+    new Request('https://sellora-commerce.example.workers.dev/api/admin/infrastructure-status', {
+      headers: { Cookie: rawWorkerCookie },
+    }),
+    workerEnv
+  );
+  assert.equal(lockedInfraRes.status, 423);
+
+  const ownerCookie = await unlockPrivilegedSession(
+    { db },
+    signInRes,
+    {
+      baseUrl: 'https://sellora-commerce.example.workers.dev',
+      dispatch: (url, init) => workerEntry.fetch(new Request(url, init), workerEnv),
+    }
+  );
 
   const infraRes = await workerEntry.fetch(
     new Request('https://sellora-commerce.example.workers.dev/api/admin/infrastructure-status', {
@@ -4305,6 +4410,610 @@ test('Cloudflare Worker runtime routes all DB & media operations through D1 and 
     '/src/assets/images/hero_sellora_editorial_1794648058731.jpg'
   );
 });
+
+describe('Requirements A–E: Manual & Auto SKUs, Calibrated scrypt Admin Security Password, Strict Device/IP Gate & Scanner-Safe Gmail Approval', () => {
+  test('Requirement A: Manual & automatic SKUs, cross-table uniqueness, concurrency races, and order-referenced immutability triggers', async () => {
+    const rt = createTestRuntime();
+    try {
+      await seedInitialStoreData(rt.db);
+      const { cookie: ownerCookie } = await provisionAndSignInOwner(rt);
+
+      // 1. Create product with normalized manual SKUs (product + variant)
+      const manualRes = await rt.app.request('http://localhost:3000/api/admin/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Ikoyi Leather Folio',
+          skuMode: 'manual',
+          sku: ' iky-folio-01 ',
+          variantSku: 'iky-folio-01-black',
+          variantName: 'Obsidian Black',
+          priceNaira: 42000,
+          stockQuantity: 10,
+          status: 'active',
+        }),
+      });
+      assert.equal(manualRes.status, 201);
+      const manualProd = (await manualRes.json()) as {
+        id: string;
+        variantId: string;
+        sku: string;
+        variantSku: string;
+      };
+      assert.equal(manualProd.sku, 'IKY-FOLIO-01');
+      assert.equal(manualProd.variantSku, 'IKY-FOLIO-01-BLACK');
+
+      // 2. Duplicate manual SKU (case-insensitive) -> 409 SKU_ALREADY_EXISTS
+      const dupProdRes = await rt.app.request('http://localhost:3000/api/admin/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Duplicate SKU Product',
+          skuMode: 'manual',
+          sku: 'iky-folio-01',
+          priceNaira: 15000,
+          stockQuantity: 5,
+        }),
+      });
+      assert.equal(dupProdRes.status, 409);
+      assert.equal((await dupProdRes.json()).code, 'SKU_ALREADY_EXISTS');
+
+      // 3. Cross-table uniqueness: product SKU cannot collide with an existing variant SKU, and vice versa
+      const crossProdRes = await rt.app.request('http://localhost:3000/api/admin/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Cross Table Product',
+          skuMode: 'manual',
+          sku: 'iky-folio-01-black',
+          priceNaira: 18000,
+          stockQuantity: 5,
+        }),
+      });
+      assert.equal(crossProdRes.status, 409);
+      assert.equal((await crossProdRes.json()).code, 'SKU_ALREADY_EXISTS');
+
+      const crossVarRes = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}/variants`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Tan Variant',
+          skuMode: 'manual',
+          sku: 'IKY-FOLIO-01',
+          stockQuantity: 3,
+        }),
+      });
+      assert.equal(crossVarRes.status, 409);
+      assert.equal((await crossVarRes.json()).code, 'SKU_ALREADY_EXISTS');
+
+      // 4. Add a second manual variant safely & an auto-generated third variant
+      const tanVarRes = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}/variants`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Tan Leather',
+          skuMode: 'manual',
+          sku: 'IKY-FOLIO-01-TAN',
+          stockQuantity: 6,
+        }),
+      });
+      assert.equal(tanVarRes.status, 201);
+      const tanVar = (await tanVarRes.json()) as { id: string; sku: string };
+      assert.equal(tanVar.sku, 'IKY-FOLIO-01-TAN');
+
+      const autoVarRes = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}/variants`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          name: 'Olive Suede',
+          skuMode: 'auto',
+          stockQuantity: 4,
+        }),
+      });
+      assert.equal(autoVarRes.status, 201);
+
+      // 5. Concurrent manual SKU creation race -> only one succeeds (201), duplicate fails cleanly (409)
+      const [raceA, raceB] = await Promise.all([
+        rt.app.request('http://localhost:3000/api/admin/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+          body: JSON.stringify({
+            name: 'Race Product A',
+            skuMode: 'manual',
+            sku: 'RACE-CONCURRENT-77',
+            priceNaira: 12000,
+            stockQuantity: 2,
+          }),
+        }),
+        rt.app.request('http://localhost:3000/api/admin/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+          body: JSON.stringify({
+            name: 'Race Product B',
+            skuMode: 'manual',
+            sku: 'race-concurrent-77',
+            priceNaira: 12000,
+            stockQuantity: 2,
+          }),
+        }),
+      ]);
+      const raceStatuses = [raceA.status, raceB.status].sort();
+      assert.deepEqual(raceStatuses, [201, 409]);
+
+      // 6. Unordered product & variant SKUs CAN be edited safely
+      const renameProdSku = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({ sku: 'IKY-FOLIO-PRIME' }),
+      });
+      assert.equal(renameProdSku.status, 200);
+      assert.equal((await renameProdSku.json()).sku, 'IKY-FOLIO-PRIME');
+
+      const renameVarSku = await rt.app.request(`http://localhost:3000/api/admin/variants/${tanVar.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({ sku: 'IKY-FOLIO-TAN-02' }),
+      });
+      assert.equal(renameVarSku.status, 200);
+      assert.equal((await renameVarSku.json()).sku, 'IKY-FOLIO-TAN-02');
+
+      // 7. Place a POS order referencing the variant -> snapshot order_items.sku, block future SKU mutations
+      const posRes = await rt.app.request('http://localhost:3000/api/admin/pos/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          customerName: 'Tunde Bakare',
+          customerEmail: 'tunde@example.com',
+          customerPhone: '08030000000',
+          items: [{ productId: manualProd.id, variantId: tanVar.id, quantity: 1 }],
+          markPaid: true,
+        }),
+      });
+      assert.equal(posRes.status, 201);
+      const posOrder = (await posRes.json()) as { orderId: string };
+
+      const itemSnapshot = await rt.db.get<{ sku: string }>(
+        `SELECT sku FROM order_items WHERE order_id = ?`,
+        [posOrder.orderId]
+      );
+      assert.equal(itemSnapshot?.sku, 'IKY-FOLIO-TAN-02');
+
+      // Attempted product & variant SKU change after order -> 409 SKU_REFERENCED_BY_ORDER
+      const lockedProdPatch = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({ sku: 'IKY-MUTATE-AFTER-ORDER' }),
+      });
+      assert.equal(lockedProdPatch.status, 409);
+      assert.equal((await lockedProdPatch.json()).code, 'SKU_REFERENCED_BY_ORDER');
+
+      const lockedVarPatch = await rt.app.request(`http://localhost:3000/api/admin/variants/${tanVar.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({ sku: 'IKY-VAR-MUTATE-AFTER-ORDER' }),
+      });
+      assert.equal(lockedVarPatch.status, 409);
+      assert.equal((await lockedVarPatch.json()).code, 'SKU_REFERENCED_BY_ORDER');
+
+      // Raw DB trigger check: silent SQL UPDATE on ordered SKU aborts with SKU_REFERENCED_BY_ORDER
+      let dbGuardCaught = '';
+      try {
+        await rt.db.run(`UPDATE product_variants SET sku = 'BYPASS-ATTEMPT' WHERE id = ?`, [tanVar.id]);
+      } catch (err) {
+        dbGuardCaught = extractDbGuardCode(err) || '';
+      }
+      assert.equal(dbGuardCaught, 'SKU_REFERENCED_BY_ORDER');
+
+      // Updating non-SKU fields (name) still works cleanly while SKU & order_items snapshot stay immutable
+      const safeNonSkuEdit = await rt.app.request(`http://localhost:3000/api/admin/products/${manualProd.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({ name: 'Ikoyi Leather Folio Edition 2' }),
+      });
+      assert.equal(safeNonSkuEdit.status, 200);
+      const afterItemSnapshot = await rt.db.get<{ sku: string }>(
+        `SELECT sku FROM order_items WHERE order_id = ?`,
+        [posOrder.orderId]
+      );
+      assert.equal(afterItemSnapshot?.sku, 'IKY-FOLIO-TAN-02');
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Requirement B: Separate Admin Security Password uses calibrated scrypt (N=16384), progressive lockout, and recovery flows', async () => {
+    const rt = createTestRuntime();
+    try {
+      await seedInitialStoreData(rt.db);
+      const { cookie: ownerCookie, userId } = await provisionAndSignInOwner(rt, {
+        secPassword: 'FirstSecPassword!99',
+      });
+
+      // 1. Stored hash uses calibrated scrypt N=16384,r=8,p=1 (dkLen=64), never plaintext
+      const cred = await rt.db.get<{ password_hash: string; hash_algorithm: string }>(
+        `SELECT password_hash, hash_algorithm FROM admin_security_credentials WHERE user_id = ?`,
+        [userId]
+      );
+      assert.ok(cred);
+      assert.equal(cred.hash_algorithm, 'scrypt_N16384_r8_p1_dkLen64');
+      assert.match(cred.password_hash, /^scrypt\$N=16384\$r=8\$p=1\$dkLen=64\$[a-f0-9]{32}\$[a-f0-9]{128}$/);
+      assert.equal(cred.password_hash.includes('FirstSecPassword!99'), false);
+
+      // 2. Authenticate from same trusted cookie+IP in a fresh session -> skips Gmail lock, requires security password check
+      const trustedDeviceCookiePart = ownerCookie
+        .split(';')
+        .map((s) => s.trim())
+        .find((s) => s.startsWith('sellora_admin_device='));
+      assert.ok(trustedDeviceCookiePart);
+
+      const secondSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: trustedDeviceCookiePart,
+        },
+        body: JSON.stringify({
+          email: 'olarindevictor046@gmail.com',
+          password: 'StrongOwnerPassword123!',
+        }),
+      });
+      assert.equal(secondSignIn.status, 200);
+      const secondCookie = `${extractCookieHeader(secondSignIn)}; ${trustedDeviceCookiePart}`;
+
+      // Accessing admin route before verifying secondary password -> 423 ADMIN_SEC_PASSWORD_REQUIRED
+      const blockedBeforeSecPwd = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: secondCookie },
+      });
+      assert.equal(blockedBeforeSecPwd.status, 423);
+      assert.equal((await blockedBeforeSecPwd.json()).lockCode, 'ADMIN_SEC_PASSWORD_REQUIRED');
+
+      // 3. Wrong secondary passwords increment attempts and trigger persistent 429 lockout on threshold
+      for (let i = 0; i < 4; i++) {
+        const wrong = await rt.app.request('http://localhost:3000/api/admin/security/password/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: secondCookie },
+          body: JSON.stringify({ password: `WrongSec#${i}` }),
+        });
+        assert.equal(wrong.status, 401);
+      }
+      const fifthWrong = await rt.app.request('http://localhost:3000/api/admin/security/password/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: secondCookie },
+        body: JSON.stringify({ password: 'WrongSec#5' }),
+      });
+      assert.equal(fifthWrong.status, 429);
+      assert.ok(fifthWrong.headers.get('retry-after'));
+
+      // Reset cooldown expiry in DB so we can verify correct password + change + recovery in tests
+      await rt.db.run(
+        `UPDATE admin_security_credentials SET locked_until_ms = 0, failed_attempts = 0 WHERE user_id = ?`,
+        [userId]
+      );
+
+      const okVerify = await rt.app.request('http://localhost:3000/api/admin/security/password/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: secondCookie },
+        body: JSON.stringify({ password: 'FirstSecPassword!99' }),
+      });
+      assert.equal(okVerify.status, 200);
+
+      // 4. Change Admin Security Password -> invalidates OTHER active sessions' verification
+      const changeRes = await rt.app.request('http://localhost:3000/api/admin/security/password/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          currentPassword: 'FirstSecPassword!99',
+          newPassword: 'SecondSecPassword!2026',
+        }),
+      });
+      assert.equal(changeRes.status, 200);
+      const changeJson = (await changeRes.json()) as { ok: boolean; recoveryCode?: string };
+      assert.equal(changeJson.ok, true);
+      assert.ok(changeJson.recoveryCode);
+
+      // Second session must now re-verify secondary password
+      const secondAfterChange = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: secondCookie },
+      });
+      assert.equal(secondAfterChange.status, 423);
+      assert.equal((await secondAfterChange.json()).lockCode, 'ADMIN_SEC_PASSWORD_REQUIRED');
+
+      // 5. Recover via Brevo email recovery token AND via single-use backup recovery code
+      const recReqRes = await rt.app.request('http://localhost:3000/api/admin/security/password/recover/request', {
+        method: 'POST',
+        headers: { Cookie: secondCookie },
+      });
+      assert.equal(recReqRes.status, 200);
+
+      const recEmail = await rt.db.get<{ html_body: string }>(
+        `SELECT html_body FROM email_notification_events
+         WHERE notification_type = 'security_admin_password_recovery'
+         ORDER BY created_at DESC LIMIT 1`
+      );
+      assert.ok(recEmail?.html_body);
+      const hexMatch = recEmail.html_body.match(/([a-f0-9]{64})/);
+      assert.ok(hexMatch?.[1]);
+
+      const recConfirmEmail = await rt.app.request('http://localhost:3000/api/admin/security/password/recover/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: secondCookie },
+        body: JSON.stringify({
+          recoveryTokenOrCode: hexMatch[1],
+          newPassword: 'RecoveredByEmail!2026',
+        }),
+      });
+      assert.equal(recConfirmEmail.status, 200);
+      const rotatedCode = (await recConfirmEmail.json()).recoveryCode as string;
+      assert.ok(rotatedCode);
+
+      // Now recover using the rotated offline backup code on another session
+      const recConfirmCode = await rt.app.request('http://localhost:3000/api/admin/security/password/recover/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
+        body: JSON.stringify({
+          recoveryTokenOrCode: rotatedCode,
+          newPassword: 'RecoveredByBackup!2026',
+        }),
+      });
+      assert.equal(recConfirmCode.status, 200);
+
+      // Primary password remained completely unchanged throughout secondary recovery
+      const ordersNow = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: ownerCookie },
+      });
+      assert.equal(ordersNow.status, 200);
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Requirements C, D & E: Strict unfamiliar device/IP lock, scanner-safe Gmail approval, session-only expiry, revocation & customer isolation', async () => {
+    const rt = createTestRuntime();
+    try {
+      await seedInitialStoreData(rt.db);
+      const { cookie: trustedOwnerCookie, userId } = await provisionAndSignInOwner(rt);
+
+      // 1. Fresh sign-in WITHOUT device cookie triggers strict ADMIN_SECURITY_LOCKED and queues Brevo alert
+      const unfamiliarSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X) Chrome/126.0',
+        },
+        body: JSON.stringify({
+          email: 'olarindevictor046@gmail.com',
+          password: 'StrongOwnerPassword123!',
+        }),
+      });
+      assert.equal(unfamiliarSignIn.status, 200);
+      const unfamiliarCookie = extractCookieHeader(unfamiliarSignIn);
+
+      const lockedAdminAttempt = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: unfamiliarCookie },
+      });
+      assert.equal(lockedAdminAttempt.status, 423);
+      assert.equal((await lockedAdminAttempt.json()).lockCode, 'ADMIN_SECURITY_LOCKED');
+
+      const alertEmail = await rt.db.get<{ recipient_email: string; html_body: string }>(
+        `SELECT recipient_email, html_body FROM email_notification_events
+         WHERE notification_type = 'security_admin_approval_required'
+         ORDER BY created_at DESC LIMIT 1`
+      );
+      assert.equal(alertEmail?.recipient_email, 'olarindevictor046@gmail.com');
+      assert.ok(alertEmail?.html_body.includes('WAT'));
+      assert.ok(alertEmail?.html_body.includes('UTC'));
+      assert.equal(alertEmail?.html_body.includes('StrongOwnerPassword123!'), false);
+
+      const approveTok = alertEmail!.html_body.match(/action=approve(?:&amp;|&)token=([A-Za-z0-9_-]+)/)![1];
+      const rejectTok = alertEmail!.html_body.match(/action=reject(?:&amp;|&)token=([A-Za-z0-9_-]+)/)![1];
+      assert.ok(approveTok && rejectTok);
+
+      // 2. Email scanner safety: GET /api/security/admin-approval renders confirmation page and NEVER approves/consumes
+      const scannerGet = await rt.app.request(
+        `http://localhost:3000/api/security/admin-approval?action=approve&token=${encodeURIComponent(approveTok)}`
+      );
+      assert.equal(scannerGet.status, 200);
+      const scannerHtml = await scannerGet.text();
+      assert.ok(scannerHtml.includes('YES — APPROVE ACCESS'));
+      assert.ok(scannerHtml.includes('method="POST"'));
+
+      const pendingAfterScanner = await rt.db.get<{ id: string; status: string }>(
+        `SELECT id, status FROM admin_login_approvals ORDER BY created_at DESC LIMIT 1`
+      );
+      assert.equal(pendingAfterScanner?.status, 'pending');
+
+      // Mismatched action submitted on POST is rejected cleanly (400) without mutating status
+      const mismatchPost = await rt.app.request('http://localhost:3000/api/security/admin-approval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'reject', token: approveTok }),
+      });
+      assert.equal(mismatchPost.status, 400);
+
+      // 3. Explicit POST rejection terminates ONLY that session while leaving trusted session active
+      const explicitReject = await rt.app.request('http://localhost:3000/api/security/admin-approval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'reject', token: rejectTok }),
+      });
+      assert.equal(explicitReject.status, 200);
+      assert.equal((await explicitReject.json()).decision, 'rejected');
+
+      // Rejected session is deleted -> 401; trustedOwnerCookie remains 200
+      const rejectedOrdersAttempt = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: unfamiliarCookie },
+      });
+      assert.equal(rejectedOrdersAttempt.status, 401);
+      assert.equal(
+        (await rt.app.request('http://localhost:3000/api/admin/orders', { headers: { Cookie: trustedOwnerCookie } })).status,
+        200
+      );
+
+      // 4. Session-only approval expiry: timed-out request expires ONLY its session and NEVER permanently locks account
+      const timedSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'olarindevictor046@gmail.com',
+          password: 'StrongOwnerPassword123!',
+        }),
+      });
+      assert.equal(timedSignIn.status, 200);
+      const timedCookie = extractCookieHeader(timedSignIn);
+
+      const timedRow = await rt.db.get<{ id: string; session_id: string }>(
+        `SELECT id, session_id FROM admin_login_approvals WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1`
+      );
+      assert.ok(timedRow);
+      // Force expiration in past
+      await rt.db.run(
+        `UPDATE admin_login_approvals SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?`,
+        [timedRow.id]
+      );
+
+      const expiredCheck = await rt.app.request('http://localhost:3000/api/admin/security/status', {
+        headers: { Cookie: timedCookie },
+      });
+      assert.equal(expiredCheck.status, 200);
+      const expiredJson = ((await expiredCheck.json()) as {
+        adminSecurity: {
+          unlocked: boolean;
+          lockCode: string;
+          deviceApprovalStatus: string;
+        };
+      }).adminSecurity;
+      assert.equal(expiredJson.unlocked, false);
+      assert.equal(expiredJson.lockCode, 'ADMIN_SECURITY_LOCKED');
+      assert.equal(expiredJson.deviceApprovalStatus, 'expired');
+
+      // Confirm admin account is NOT permanently locked: fresh login succeeds & gets a brand-new pending approval
+      const freshRetrySignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'olarindevictor046@gmail.com',
+          password: 'StrongOwnerPassword123!',
+        }),
+      });
+      assert.equal(freshRetrySignIn.status, 200);
+      const unlockedFreshCookie = await unlockPrivilegedSession(rt, freshRetrySignIn);
+      assert.equal(
+        (await rt.app.request('http://localhost:3000/api/admin/orders', { headers: { Cookie: unlockedFreshCookie } })).status,
+        200
+      );
+
+      // 5. Missing device cookie mid-session -> immediate re-lock (423 ADMIN_SECURITY_LOCKED)
+      const sessionOnlyPart = unlockedFreshCookie
+        .split(';')
+        .map((s) => s.trim())
+        .find((s) => !s.startsWith('sellora_admin_device='))!;
+      const strippedDeviceReq = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: sessionOnlyPart },
+      });
+      assert.equal(strippedDeviceReq.status, 423);
+      assert.equal((await strippedDeviceReq.json()).lockCode, 'ADMIN_SECURITY_LOCKED');
+
+      // 6. Requirement E: Admin Security Overview, Approval Decide & Device Revocation
+      const overviewRes = await rt.app.request('http://localhost:3000/api/admin/security/overview', {
+        headers: { Cookie: trustedOwnerCookie },
+      });
+      assert.equal(overviewRes.status, 200);
+      const overview = (await overviewRes.json()) as {
+        trustedDevices: Array<{ id: string; is_active: number; user_id: string }>;
+        pendingApprovals: Array<{ id: string; status: string }>;
+        recentLogins: Array<{ ip_address: string }>;
+        securityEvents: Array<{ event_ref: string }>;
+      };
+      assert.ok(overview.trustedDevices.length >= 1);
+      assert.ok(overview.recentLogins.length >= 1);
+      assert.ok(overview.securityEvents.length >= 1);
+
+      // Sign in again on unknown device, approve via authenticated trusted dashboard /decide endpoint
+      const pendingDashSignIn = await rt.app.request('http://localhost:3000/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'olarindevictor046@gmail.com',
+          password: 'StrongOwnerPassword123!',
+        }),
+      });
+      const pendingDashCookie = extractCookieHeader(pendingDashSignIn);
+      const pendingApv = await rt.db.get<{ id: string }>(
+        `SELECT id FROM admin_login_approvals WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1`
+      );
+      assert.ok(pendingApv);
+
+      const dashDecideRes = await rt.app.request(
+        `http://localhost:3000/api/admin/security/approvals/${pendingApv.id}/decide`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: trustedOwnerCookie },
+          body: JSON.stringify({ action: 'approve' }),
+        }
+      );
+      assert.equal(dashDecideRes.status, 200);
+
+      // That approved session still requires secondary password, then enters!
+      const afterDashApprove = await rt.app.request('http://localhost:3000/api/admin/orders', {
+        headers: { Cookie: pendingDashCookie },
+      });
+      assert.equal(afterDashApprove.status, 423);
+      assert.equal((await afterDashApprove.json()).lockCode, 'ADMIN_SEC_PASSWORD_REQUIRED');
+
+      const verifyRes = await rt.app.request('http://localhost:3000/api/admin/security/password/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: pendingDashCookie },
+        body: JSON.stringify({ password: 'AdminSecPass#2026!' }),
+      });
+      assert.equal(verifyRes.status, 200);
+      assert.equal(
+        (await rt.app.request('http://localhost:3000/api/admin/orders', { headers: { Cookie: pendingDashCookie } })).status,
+        200
+      );
+
+      // Revoking a non-current trusted device terminates that device's active session immediately
+      const overview2 = await (
+        await rt.app.request('http://localhost:3000/api/admin/security/overview', {
+          headers: { Cookie: trustedOwnerCookie },
+        })
+      ).json();
+      const nonCurrentActiveDevice = overview2.trustedDevices.find(
+        (d: any) => d.is_active === 1 && d.user_id === userId && overview2.trustedDevices.indexOf(d) !== overview2.trustedDevices.length - 1
+      );
+      if (nonCurrentActiveDevice) {
+        const revRes = await rt.app.request(
+          `http://localhost:3000/api/admin/security/devices/${nonCurrentActiveDevice.id}`,
+          {
+            method: 'DELETE',
+            headers: { Cookie: trustedOwnerCookie },
+          }
+        );
+        assert.equal(revRes.status, 200);
+      }
+
+      // 7. Customer accounts remain completely exempt from strict admin gate
+      const custSignUp = await rt.app.request('http://localhost:3000/api/auth/sign-up/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Chidi Okonkwo',
+          email: 'chidi@shopper.test',
+          password: 'ShopperPassword123!',
+        }),
+      });
+      assert.equal(custSignUp.status, 200);
+      const custCookie = extractCookieHeader(custSignUp);
+      const custMe = await (
+        await rt.app.request('http://localhost:3000/api/me', { headers: { Cookie: custCookie } })
+      ).json();
+      assert.equal(custMe.user.role, 'customer');
+      assert.equal(custMe.adminSecurity?.required ?? false, false);
+    } finally {
+      fs.rmSync(rt.tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 
 
 

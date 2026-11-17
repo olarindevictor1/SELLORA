@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Copy, Pencil, Plus, Trash2, Upload } from 'lucide-react';
+import { Copy, Lock, Pencil, Plus, Trash2, Upload } from 'lucide-react';
 import { apiFetch } from '../../lib/api';
 import { formatLagosDate, formatNgn } from '../../shared/types';
 
@@ -24,6 +24,9 @@ export const AdminCatalogTab: React.FC<{
   // Create Product Form
   const [showForm, setShowForm] = useState(false);
   const [pName, setPName] = useState('');
+  const [pSkuMode, setPSkuMode] = useState<'auto' | 'manual'>('auto');
+  const [pSku, setPSku] = useState('');
+  const [pVariantSku, setPVariantSku] = useState('');
   const [pShort, setPShort] = useState('');
   const [pDesc, setPDesc] = useState('');
   const [pCategoryId, setPCategoryId] = useState('');
@@ -35,9 +38,10 @@ export const AdminCatalogTab: React.FC<{
   const [pLowThresh, setPLowThresh] = useState('5');
   const [pImageUrl, setPImageUrl] = useState('');
 
-  // Edit Product Form (SKU preserved read-only)
+  // Edit Product Form + Variant Management
   const [editingProd, setEditingProd] = useState<any>(null);
   const [eName, setEName] = useState('');
+  const [eSku, setESku] = useState('');
   const [eShort, setEShort] = useState('');
   const [eDesc, setEDesc] = useState('');
   const [eCategoryId, setECategoryId] = useState('');
@@ -47,6 +51,14 @@ export const AdminCatalogTab: React.FC<{
   const [eCostPrice, setECostPrice] = useState('');
   const [eLowThresh, setELowThresh] = useState('5');
   const [eImageUrl, setEImageUrl] = useState('');
+
+  // Add Variant Form inside Edit Product
+  const [newVarName, setNewVarName] = useState('');
+  const [newVarSkuMode, setNewVarSkuMode] = useState<'auto' | 'manual'>('auto');
+  const [newVarSku, setNewVarSku] = useState('');
+  const [newVarPrice, setNewVarPrice] = useState('');
+  const [newVarStock, setNewVarStock] = useState('0');
+  const [variantSkuEdits, setVariantSkuEdits] = useState<Record<string, string>>({});
 
   // Quick Category
   const [newCatName, setNewCatName] = useState('');
@@ -98,11 +110,14 @@ export const AdminCatalogTab: React.FC<{
   const createProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
+    setMsg(null);
     try {
-      const res = await apiFetch<{ id: string; sku: string }>('/api/admin/products', {
+      const res = await apiFetch<{ id: string; sku: string; variantSku?: string }>('/api/admin/products', {
         method: 'POST',
         body: JSON.stringify({
           name: pName,
+          skuMode: pSkuMode,
+          ...(pSkuMode === 'manual' ? { sku: pSku, variantSku: pVariantSku || undefined } : {}),
           shortDescription: pShort,
           description: pDesc,
           categoryId: pCategoryId || null,
@@ -119,13 +134,16 @@ export const AdminCatalogTab: React.FC<{
       });
       setShowForm(false);
       setPName('');
+      setPSkuMode('auto');
+      setPSku('');
+      setPVariantSku('');
       setPShort('');
       setPDesc('');
       setPPrice('');
       setPSalePrice('');
       setPCostPrice('');
       setPImageUrl('');
-      setMsg(`Product created with assigned SKU ${res.sku}.`);
+      setMsg(`Product created with SKU ${res.sku}${res.variantSku ? ` (Variant ${res.variantSku})` : ''}.`);
       await load();
     } catch (e: any) {
       setErr(e.message);
@@ -136,6 +154,7 @@ export const AdminCatalogTab: React.FC<{
     setShowForm(false);
     setEditingProd(p);
     setEName(p.name || '');
+    setESku(p.sku || '');
     setEShort(p.short_description || '');
     setEDesc(p.description || '');
     setECategoryId(p.category_id || '');
@@ -145,31 +164,99 @@ export const AdminCatalogTab: React.FC<{
     setECostPrice(p.cost_price_kobo !== null && p.cost_price_kobo !== undefined ? String(p.cost_price_kobo / 100) : '');
     setELowThresh(String(p.low_stock_threshold ?? 5));
     setEImageUrl((p.media && p.media[0]) || '');
+    const vEdits: Record<string, string> = {};
+    for (const v of p.variants || []) {
+      vEdits[v.id] = v.sku || '';
+    }
+    setVariantSkuEdits(vEdits);
+    setNewVarName('');
+    setNewVarSkuMode('auto');
+    setNewVarSku('');
+    setNewVarPrice(p.price_kobo ? String(p.price_kobo / 100) : '');
+    setNewVarStock('0');
   };
 
   const saveEditProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingProd) return;
     setErr(null);
+    setMsg(null);
     try {
+      const payload: Record<string, unknown> = {
+        name: eName,
+        shortDescription: eShort,
+        description: eDesc,
+        categoryId: eCategoryId || null,
+        collectionId: eCollectionId || null,
+        priceNaira: Number(ePrice),
+        salePriceNaira: eSalePrice ? Number(eSalePrice) : null,
+        costPriceNaira: eCostPrice ? Number(eCostPrice) : null,
+        lowStockThreshold: Number(eLowThresh || 5),
+        media: eImageUrl ? [eImageUrl] : editingProd.media || [],
+      };
+      if (!editingProd.hasOrderedItems && eSku.trim() && eSku.trim().toUpperCase() !== String(editingProd.sku).toUpperCase()) {
+        payload.sku = eSku.trim();
+      }
       await apiFetch(`/api/admin/products/${editingProd.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({
-          name: eName,
-          shortDescription: eShort,
-          description: eDesc,
-          categoryId: eCategoryId || null,
-          collectionId: eCollectionId || null,
-          priceNaira: Number(ePrice),
-          salePriceNaira: eSalePrice ? Number(eSalePrice) : null,
-          costPriceNaira: eCostPrice ? Number(eCostPrice) : null,
-          lowStockThreshold: Number(eLowThresh || 5),
-          media: eImageUrl ? [eImageUrl] : editingProd.media || [],
-        }),
+        body: JSON.stringify(payload),
       });
       setEditingProd(null);
-      setMsg('Product updated. Existing SKU preserved.');
+      setMsg('Product updated cleanly.');
       await load();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const addProductVariant = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingProd || !newVarName.trim()) return;
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ id: string; sku: string }>(
+        `/api/admin/products/${editingProd.id}/variants`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            name: newVarName.trim(),
+            skuMode: newVarSkuMode,
+            ...(newVarSkuMode === 'manual' ? { sku: newVarSku.trim() } : {}),
+            priceNaira: newVarPrice ? Number(newVarPrice) : undefined,
+            stockQuantity: Number(newVarStock || 0),
+          }),
+        }
+      );
+      setMsg(`Variant added with SKU ${res.sku}.`);
+      setNewVarName('');
+      setNewVarSku('');
+      await load();
+      const refreshed = await apiFetch<{ products: any[] }>('/api/admin/products');
+      const updated = (refreshed.products || []).find((p) => p.id === editingProd.id);
+      if (updated) openEditProduct(updated);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const saveVariantSku = async (variant: any) => {
+    const targetSku = (variantSkuEdits[variant.id] || '').trim();
+    if (!targetSku) return;
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await apiFetch<{ sku: string }>(`/api/admin/variants/${variant.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ sku: targetSku }),
+      });
+      setMsg(`Variant SKU updated to ${res.sku}.`);
+      await load();
+      if (editingProd) {
+        const refreshed = await apiFetch<{ products: any[] }>('/api/admin/products');
+        const updated = (refreshed.products || []).find((p) => p.id === editingProd.id);
+        if (updated) openEditProduct(updated);
+      }
     } catch (e: any) {
       setErr(e.message);
     }
@@ -305,8 +392,39 @@ export const AdminCatalogTab: React.FC<{
                   placeholder="Product Name *"
                   className="rounded-lg border border-slate-300 px-3 py-2"
                 />
-                <div className="rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 text-slate-500 flex items-center">
-                  SKU assigned automatically on save
+                <div className="sm:col-span-2 flex flex-wrap items-center gap-2">
+                  <select
+                    value={pSkuMode}
+                    onChange={(e) => setPSkuMode(e.target.value as 'auto' | 'manual')}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-semibold text-[#172554]"
+                    aria-label="SKU Mode"
+                  >
+                    <option value="auto">Automatic SKU</option>
+                    <option value="manual">Manual SKU</option>
+                  </select>
+                  {pSkuMode === 'auto' ? (
+                    <div className="flex-1 rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 text-slate-500">
+                      Unique SLR-... product & variant SKUs generated automatically on save
+                    </div>
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        required
+                        value={pSku}
+                        onChange={(e) => setPSku(e.target.value.toUpperCase())}
+                        placeholder="Product SKU * (e.g. SLR-AUDIO-01)"
+                        className="flex-1 min-w-[160px] rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular uppercase"
+                      />
+                      <input
+                        type="text"
+                        value={pVariantSku}
+                        onChange={(e) => setPVariantSku(e.target.value.toUpperCase())}
+                        placeholder="Initial Variant SKU (optional)"
+                        className="flex-1 min-w-[160px] rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular uppercase"
+                      />
+                    </>
+                  )}
                 </div>
                 <select
                   value={pCategoryId}
@@ -516,7 +634,11 @@ export const AdminCatalogTab: React.FC<{
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="text-sm font-bold text-[#172554]">Edit Product: {editingProd.name}</h3>
-                <span className="text-slate-500">Existing SKU is preserved and never regenerated</span>
+                <span className="text-slate-500">
+                  {editingProd.hasOrderedItems
+                    ? 'SKU locked because this item appears in existing orders'
+                    : 'SKUs must remain unique across all products & variants'}
+                </span>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
@@ -530,19 +652,31 @@ export const AdminCatalogTab: React.FC<{
                   />
                 </div>
                 <div>
-                  <label className="block font-semibold mb-1">Assigned SKU (Read-only)</label>
-                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 font-mono-tabular text-slate-600">
-                    <span className="flex-1 truncate">{editingProd.sku}</span>
-                    {isOwner && editingProd.sku && (
-                      <button
-                        type="button"
-                        onClick={() => copySku(editingProd.sku)}
-                        className="text-[#172554] hover:underline font-sans text-[11px] font-semibold"
-                      >
-                        Copy
-                      </button>
-                    )}
-                  </div>
+                  <label className="block font-semibold mb-1">
+                    Product SKU {editingProd.hasOrderedItems ? '(Order-Locked)' : '(Editable)'}
+                  </label>
+                  {editingProd.hasOrderedItems ? (
+                    <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-[#F5F7F4] px-3 py-2 font-mono-tabular text-slate-600">
+                      <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                      <span className="flex-1 truncate">{editingProd.sku}</span>
+                      {isOwner && editingProd.sku && (
+                        <button
+                          type="button"
+                          onClick={() => copySku(editingProd.sku)}
+                          className="text-[#172554] hover:underline font-sans text-[11px] font-semibold"
+                        >
+                          Copy
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      value={eSku}
+                      onChange={(e) => setESku(e.target.value.toUpperCase())}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-tabular uppercase"
+                    />
+                  )}
                 </div>
                 <div>
                   <label className="block font-semibold mb-1">Category</label>
@@ -664,6 +798,112 @@ export const AdminCatalogTab: React.FC<{
                 >
                   Cancel
                 </button>
+              </div>
+
+              {/* Variants & SKUs Manager */}
+              <div className="border-t border-slate-200 pt-5 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="font-bold text-[#172554]">
+                    Product Variants & SKUs ({(editingProd.variants || []).length})
+                  </h4>
+                  <span className="text-[11px] text-slate-500">
+                    Order-referenced variant SKUs remain immutable to protect order history
+                  </span>
+                </div>
+                <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+                  {(editingProd.variants || []).map((v: any) => (
+                    <div
+                      key={v.id}
+                      className="p-3 flex flex-wrap items-center justify-between gap-3 bg-[#F5F7F4]/40"
+                    >
+                      <div>
+                        <div className="font-semibold text-[#172554]">{v.name}</div>
+                        <div className="text-[11px] text-slate-500 tabular-nums">
+                          {formatNgn(v.sale_price_kobo ?? v.price_kobo)} · {v.stock_quantity} in stock
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {v.hasOrderedItems ? (
+                          <span className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2.5 py-1 font-mono-tabular text-slate-600">
+                            <Lock className="w-3 h-3 text-slate-400" /> {v.sku}
+                          </span>
+                        ) : (
+                          <>
+                            <input
+                              type="text"
+                              value={variantSkuEdits[v.id] ?? v.sku}
+                              onChange={(e) =>
+                                setVariantSkuEdits({
+                                  ...variantSkuEdits,
+                                  [v.id]: e.target.value.toUpperCase(),
+                                })
+                              }
+                              className="rounded border border-slate-300 bg-white px-2.5 py-1 font-mono-tabular uppercase"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => saveVariantSku(v)}
+                              className="rounded border border-[#172554] px-2.5 py-1 font-semibold text-[#172554] hover:bg-[#172554] hover:text-[#B7F36B]"
+                            >
+                              Update SKU
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-6 gap-2 pt-1">
+                  <input
+                    type="text"
+                    value={newVarName}
+                    onChange={(e) => setNewVarName(e.target.value)}
+                    placeholder="New Variant Name (e.g. Obsidian 64GB)"
+                    className="sm:col-span-2 rounded-lg border border-slate-300 px-3 py-1.5"
+                  />
+                  <select
+                    value={newVarSkuMode}
+                    onChange={(e) => setNewVarSkuMode(e.target.value as 'auto' | 'manual')}
+                    className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-semibold"
+                  >
+                    <option value="auto">Auto SKU</option>
+                    <option value="manual">Manual SKU</option>
+                  </select>
+                  {newVarSkuMode === 'manual' ? (
+                    <input
+                      type="text"
+                      value={newVarSku}
+                      onChange={(e) => setNewVarSku(e.target.value.toUpperCase())}
+                      placeholder="Variant SKU"
+                      className="rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono-tabular uppercase"
+                    />
+                  ) : (
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={newVarPrice}
+                      onChange={(e) => setNewVarPrice(e.target.value)}
+                      placeholder="Price NGN"
+                      className="rounded-lg border border-slate-300 px-2.5 py-1.5"
+                    />
+                  )}
+                  <input
+                    type="number"
+                    min={0}
+                    value={newVarStock}
+                    onChange={(e) => setNewVarStock(e.target.value)}
+                    placeholder="Stock"
+                    className="rounded-lg border border-slate-300 px-2.5 py-1.5"
+                  />
+                  <button
+                    type="button"
+                    onClick={addProductVariant}
+                    className="rounded-lg bg-[#172554] px-3 py-1.5 font-bold text-[#B7F36B]"
+                  >
+                    + Add Variant
+                  </button>
+                </div>
               </div>
             </form>
           )}

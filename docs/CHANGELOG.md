@@ -4,6 +4,15 @@ This log distinguishes verified workspace observations from earlier reported mil
 
 ---
 
+## 2026-11-17 — Security and SKU Specification Update *(Documentation & Pre-Implementation Compatibility Audit)*
+- **Extended Canonical Specifications (`docs/PROJECT_OVERVIEW.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY_BASELINE.md`, `docs/SECURITY_INCIDENT_RESPONSE.md`, `docs/PRODUCTION_LAUNCH_CHECKLIST.md`, `docs/KNOWN_ISSUES.md`)**:
+  - **A. SKU Management**: Documented dual manual and automatic SKU creation/editing for both products and individual variants, case-insensitive DB uniqueness + concurrency handling, historical order snapshot preservation (`order_items.sku`), and immutability of SKUs once referenced by any order.
+  - **B. Separate Admin Security Password**: Specified session-bound secondary admin password gate after primary Better Auth sign-in, strong salted hashing, rate-limited temporary lockouts, expiry policy, and safe onboarding/change/recovery flows preserving existing admin accounts.
+  - **C. Strict Unfamiliar-Device & IP Security Policy**: Specified fail-closed locking for privileged admin sessions whenever either a cryptographically issued `HttpOnly` device token or the client IP is unfamiliar.
+  - **D. Scanner-Safe Gmail Approval Workflow**: Specified Brevo outbox alerts to `OWNER_EMAIL` / `ADMIN_NOTIFICATION_EMAIL` with UTC/WAT details and two-step `GET` confirmation page + explicit `POST` **`YES — APPROVE ACCESS`** / **`NO — REJECT ACCESS`** actions using short-lived single-use CSPRNG tokens, plus Gmail-loss recovery runbooks.
+  - **E. Admin Security Management UI**: Specified controls in `AdminSettingsTab.tsx` for trusted devices, login attempts, pending approval requests, device/session revocation, secondary password management, and security events.
+- **Audit Scope Note**: Specification documentation and Pre-Implementation Compatibility Report completed without modifying source code, SQL migrations, or live Cloudflare resources.
+
 ## 2026-11-16 — Fail-Closed Login Lockout DB Handling & Production Configuration Preflight
 - **Fail-Closed Lockout Enforcement (`src/server/security.ts`, `src/server/app.ts`)**:
   - Updated `checkLoginThrottle()` to query `lockout_cycles` and return `{ allowed: false, unavailable: true }` on DB/schema failures instead of `{ allowed: true }`.

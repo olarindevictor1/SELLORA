@@ -39,6 +39,28 @@ export function getCartToken(): string {
   return token;
 }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  lockCode?: string;
+  retryAfterSec?: number;
+  adminSecurity?: any;
+
+  constructor(
+    message: string,
+    status: number,
+    extra?: { code?: string; lockCode?: string; retryAfterSec?: number; adminSecurity?: any }
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = extra?.code;
+    this.lockCode = extra?.lockCode;
+    this.retryAfterSec = extra?.retryAfterSec;
+    this.adminSecurity = extra?.adminSecurity;
+  }
+}
+
 export async function apiFetch<T = any>(
   path: string,
   options: RequestInit = {}
@@ -68,7 +90,12 @@ export async function apiFetch<T = any>(
   if (!res.ok) {
     const baseMsg = data?.error || data?.message || `Request failed (${res.status})`;
     const refSuffix = data?.referenceId ? ` (Reference: ${data.referenceId})` : '';
-    throw new Error(`${baseMsg}${refSuffix}`);
+    throw new ApiError(`${baseMsg}${refSuffix}`, res.status, {
+      code: data?.code,
+      lockCode: data?.lockCode,
+      retryAfterSec: data?.retryAfterSec,
+      adminSecurity: data?.adminSecurity,
+    });
   }
 
   return data as T;

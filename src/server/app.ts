@@ -24,6 +24,10 @@ import {
   withSignInEmailLock,
   writeAuditLog,
 } from './security';
+import {
+  buildAdminDeviceCookieHeader,
+  evaluateAdminLoginGate,
+} from './admin-security';
 import { createPublicRoutes } from './routes/public';
 import { createCustomerRoutes } from './routes/customer';
 import { createOrderRoutes } from './routes/orders';
@@ -200,6 +204,7 @@ export function createSelloraApiApp(deps: {
     const isHtmlOrSandboxedFile =
       path === '/api/auth/complete' ||
       path === '/api/security/login-response' ||
+      path === '/api/security/admin-approval' ||
       /^\/api\/payments\/evidence\/[^/]+\/file$/.test(path);
     if (!isHtmlOrSandboxedFile) {
       c.header('X-Frame-Options', 'DENY');
@@ -474,7 +479,7 @@ export function createSelloraApiApp(deps: {
           const sessRow = issuedToken
             ? await deps.db.get<{ id: string }>(`SELECT id FROM session WHERE token = ?`, [issuedToken])
             : null;
-          await recordLoginAttemptAndMonitor(deps.db, deps.env, {
+          const loginMonitor = await recordLoginAttemptAndMonitor(deps.db, deps.env, {
             headers: c.req.raw.headers,
             userId: userRow.id,
             email: userRow.email,
@@ -484,6 +489,30 @@ export function createSelloraApiApp(deps: {
             outcome: 'success',
             sessionId: sessRow?.id ?? null,
           });
+          if (userRow.role !== 'customer' && sessRow?.id) {
+            const gate = await evaluateAdminLoginGate(deps.db, deps.env, {
+              headers: c.req.raw.headers,
+              sessionId: sessRow.id,
+              userId: userRow.id,
+              userEmail: userRow.email,
+              userName: userRow.name,
+              loginId: loginMonitor.loginId,
+            });
+            if (gate.newDeviceCookieValue) {
+              const isHttps =
+                c.req.url.startsWith('https://') || c.req.header('x-forwarded-proto') === 'https';
+              const nextHeaders = new Headers(authRes.headers);
+              nextHeaders.append(
+                'Set-Cookie',
+                buildAdminDeviceCookieHeader(gate.newDeviceCookieValue, isHttps)
+              );
+              return new Response(authRes.body, {
+                status: authRes.status,
+                statusText: authRes.statusText,
+                headers: nextHeaders,
+              });
+            }
+          }
         }
         return authRes;
       });
@@ -491,7 +520,7 @@ export function createSelloraApiApp(deps: {
 
     const authRes = await deps.auth.handler(c.req.raw);
 
-    // Post-auth outcome auditing & Layer 3 new-device alerting
+    // Post-auth outcome auditing & Layer 3 new-device alerting + Strict Admin Device/IP Gate
     if (path === '/api/auth/callback/google') {
       const issuedToken = extractIssuedSessionToken(authRes.headers.get('set-cookie'));
       if (issuedToken) {
@@ -507,7 +536,7 @@ export function createSelloraApiApp(deps: {
             role: string;
           }>(`SELECT id, name, email, role FROM user WHERE id = ?`, [sess.userId]);
           if (userRow) {
-            await recordLoginAttemptAndMonitor(deps.db, deps.env, {
+            const loginMonitor = await recordLoginAttemptAndMonitor(deps.db, deps.env, {
               headers: c.req.raw.headers,
               userId: userRow.id,
               email: userRow.email,
@@ -517,6 +546,30 @@ export function createSelloraApiApp(deps: {
               outcome: 'success',
               sessionId: sess.id,
             });
+            if (userRow.role !== 'customer') {
+              const gate = await evaluateAdminLoginGate(deps.db, deps.env, {
+                headers: c.req.raw.headers,
+                sessionId: sess.id,
+                userId: userRow.id,
+                userEmail: userRow.email,
+                userName: userRow.name,
+                loginId: loginMonitor.loginId,
+              });
+              if (gate.newDeviceCookieValue) {
+                const isHttps =
+                  c.req.url.startsWith('https://') || c.req.header('x-forwarded-proto') === 'https';
+                const nextHeaders = new Headers(authRes.headers);
+                nextHeaders.append(
+                  'Set-Cookie',
+                  buildAdminDeviceCookieHeader(gate.newDeviceCookieValue, isHttps)
+                );
+                return new Response(authRes.body, {
+                  status: authRes.status,
+                  statusText: authRes.statusText,
+                  headers: nextHeaders,
+                });
+              }
+            }
           }
         }
       }

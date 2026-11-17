@@ -43,3 +43,26 @@ Customers or store staff report issues using a safe opaque ID such as `ERR-XXXXX
 
 - **Exposed `slr_dev_...` Key**: Immediately revoke in **Admin → Settings → Security & Support Access** (`DELETE /api/admin/developer-integrations/:id`) — access is blocked (`403`) immediately.
 - **Exposed Infrastructure Secret** (`BETTER_AUTH_SECRET`, `BREVO_API_KEY`, `BREVO_WEBHOOK_SECRET`, `GOOGLE_CLIENT_SECRET`): Rotate via `wrangler secret put` and revoke active sessions if session signing material was impacted.
+
+---
+
+## 5. Planned Incident Playbooks *(Strict Admin Security Specification — Pending Implementation)*
+
+### 5.1 Unfamiliar Device or IP Security Lock (`ADMIN_SECURITY_LOCKED`)
+- **Trigger**: An admin signs in successfully via Better Auth Email/Password or Google OAuth, but lacks either a valid recognized `HttpOnly` device token or a trusted IP for that device/account.
+- **Expected Default Behavior**: Session is immediately quarantined (`admin_login_approvals.status = 'pending'`), all Admin Dashboard & `/api/admin/*` operations remain fail-closed (`423` / `403`), and an alert email with **`YES — APPROVE ACCESS`** / **`NO — REJECT ACCESS`** confirmation links is dispatched to `OWNER_EMAIL` / `ADMIN_NOTIFICATION_EMAIL`.
+- **Response**:
+  - **Legitimate Login**: Open the email alert link (`GET /api/security/admin-approval`), confirm details match your exact timestamp/IP/device, and submit the `POST` **`YES — APPROVE ACCESS`** button. Complete the separate **Admin Security Password** check to enter the dashboard.
+  - **Unauthorized Attempt**: Submit **`NO — REJECT ACCESS`** on the confirmation page (or reject inside Admin Settings from a trusted device), immediately terminating the pending session, rotating the account password + admin security password, and auditing `login_history` + `security_events`.
+  - **Expired / Unanswered**: After link expiry (`20 minutes`), **only** that pending login session expires (`status = 'expired'`, zero auto-approval). The admin account is never permanently locked; a fresh sign-in generates a new `session_id` and issues a fresh approval request.
+
+### 5.2 Admin Security Password Lockout or Forgotten Secondary Password
+- **Repeated Wrong Attempts**: Secondary password failures increment `admin_security_credentials.failed_attempts` and enforce temporary lockout cooldowns without altering primary Better Auth credentials. Wait for cooldown expiry or trigger verified owner recovery.
+- **Forgotten Secondary Password**: Authenticated on a trusted device/IP (or after Gmail-approved session unlock), initiate the verified secondary-password recovery flow via `OWNER_EMAIL` / registered admin Gmail (`POST /api/admin/security/password/recover`), or use an emergency single-use recovery code / server-side CLI (`scripts/recover-admin-security.ts`).
+
+### 5.3 Loss of Registered Gmail Access (`OWNER_EMAIL`)
+If the store owner temporarily or permanently loses access to `olarindevictor046@gmail.com` while locked out by strict device/IP enforcement:
+1. Do **not** weaken fail-closed remote defaults or auto-approve expired tokens.
+2. Establish verified control at the infrastructure/server level using an authorized Cloudflare operator:
+   - Run the server-side recovery command (planned `scripts/recover-admin-security.ts` with `--d1-sql` for remote `wrangler d1 execute` or local SQLite) OR apply a rotated `OWNER_EMAIL` / recovery hash backed by audited `security_events` + `audit_logs`.
+   - Update `OWNER_EMAIL` & `ADMIN_NOTIFICATION_EMAIL` secrets via `wrangler secret put` / Admin Settings, re-verify owner email, register the new trusted device/IP, and revoke all old trusted devices & active sessions.

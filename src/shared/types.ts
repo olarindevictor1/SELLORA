@@ -168,3 +168,26 @@ export function formatLagosDate(isoString: string | null | undefined): string {
     timeStyle: 'short',
   }).format(d);
 }
+
+export type AdminLockCode =
+  | 'ADMIN_SECURITY_LOCKED'
+  | 'ADMIN_SEC_PASSWORD_SETUP_REQUIRED'
+  | 'ADMIN_SEC_PASSWORD_REQUIRED';
+
+export interface AdminSecurityStatus {
+  required: boolean;
+  unlocked: boolean;
+  lockCode: AdminLockCode | null;
+  deviceApprovalStatus: 'trusted' | 'pending' | 'approved' | 'rejected' | 'expired';
+  triggerReason?: string | null;
+  pendingApprovalId?: string | null;
+  approvalExpiresAt?: string | null;
+  secondaryPasswordConfigured: boolean;
+  secondaryPasswordVerified: boolean;
+  secondaryPasswordExpiresAt?: string | null;
+  secondaryPasswordLockedUntilMs?: number;
+  secondaryPasswordRetryAfterSec?: number;
+  currentIp?: string;
+  currentDeviceSummary?: string;
+}
+
